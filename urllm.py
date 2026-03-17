@@ -1,14 +1,15 @@
 """
-URLLM — URL technical footprint analyzer with GenAI architectural reasoning.
+URLLM — URL technical footprint analyzer with GDPR & security-focused
+GenAI reasoning.
 
-Deterministically extracts a web page's technical footprint (scripts, forms,
-third-party data sinks, meta tags, structured data) and feeds the result to an
-LLM for architectural analysis.  Outputs to console and optionally to Markdown.
+Deterministically extracts a web page's technical + privacy footprint and
+hands the structured JSON to an LLM for architectural, security, and GDPR
+compliance analysis.
 
 Usage:
     uv run urllm.py https://example.com
-    uv run urllm.py https://example.com --output report.md
-    uv run urllm.py https://example.com --model gpt-4o --output report.md
+    uv run urllm.py https://example.com -o report.md
+    uv run urllm.py https://example.com -m gpt-4o --json
 """
 
 from __future__ import annotations
@@ -17,6 +18,8 @@ import argparse
 import json
 import os
 import re
+import ssl
+import socket
 import sys
 import textwrap
 from dataclasses import asdict, dataclass, field
@@ -32,8 +35,181 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 
 # ---------------------------------------------------------------------------
+# Constants & known-entity databases
+# ---------------------------------------------------------------------------
+
+# Known tracker / ad-network domains (substring-matched against netloc)
+_KNOWN_TRACKERS: dict[str, str] = {
+    "google-analytics.com": "analytics",
+    "googletagmanager.com": "tag-manager",
+    "googlesyndication.com": "ad-network",
+    "googleadservices.com": "ad-network",
+    "doubleclick.net": "ad-network",
+    "facebook.net": "social-tracker",
+    "connect.facebook.net": "social-tracker",
+    "meta.com": "social-tracker",
+    "analytics.tiktok.com": "social-tracker",
+    "snap.licdn.com": "social-tracker",
+    "linkedin.com": "social-tracker",
+    "ads-twitter.com": "social-tracker",
+    "platform.twitter.com": "social-widget",
+    "hotjar.com": "session-recording",
+    "clarity.ms": "session-recording",
+    "mouseflow.com": "session-recording",
+    "fullstory.com": "session-recording",
+    "luckyorange.com": "session-recording",
+    "crazyegg.com": "session-recording",
+    "segment.io": "analytics",
+    "segment.com": "analytics",
+    "mixpanel.com": "analytics",
+    "amplitude.com": "analytics",
+    "heap.io": "analytics",
+    "heapanalytics.com": "analytics",
+    "plausible.io": "analytics-privacy-friendly",
+    "matomo.cloud": "analytics-privacy-friendly",
+    "sentry.io": "error-tracking",
+    "newrelic.com": "apm",
+    "nr-data.net": "apm",
+    "datadoghq.com": "apm",
+    "intercom.io": "customer-messaging",
+    "intercomcdn.com": "customer-messaging",
+    "crisp.chat": "customer-messaging",
+    "drift.com": "customer-messaging",
+    "hubspot.com": "marketing-automation",
+    "hs-analytics.net": "marketing-automation",
+    "hs-scripts.com": "marketing-automation",
+    "marketo.net": "marketing-automation",
+    "pardot.com": "marketing-automation",
+    "cookiebot.com": "consent-management",
+    "cookielaw.org": "consent-management",
+    "onetrust.com": "consent-management",
+    "usercentrics.eu": "consent-management",
+    "didomi.io": "consent-management",
+    "quantcast.com": "consent-management",
+    "trustarccloud.com": "consent-management",
+    "consentmanager.net": "consent-management",
+    "iubenda.com": "consent-management",
+    "osano.com": "consent-management",
+    "cloudflare.com": "cdn",
+    "cdnjs.cloudflare.com": "cdn",
+    "jsdelivr.net": "cdn",
+    "unpkg.com": "cdn",
+    "ajax.googleapis.com": "cdn",
+    "fonts.googleapis.com": "font-provider",
+    "fonts.gstatic.com": "font-provider",
+    "use.typekit.net": "font-provider",
+    "recaptcha.net": "captcha",
+    "hcaptcha.com": "captcha",
+    "challenges.cloudflare.com": "captcha",
+    "stripe.com": "payment",
+    "js.stripe.com": "payment",
+    "paypal.com": "payment",
+    "braintreegateway.com": "payment",
+    "youtube.com": "video-embed",
+    "player.vimeo.com": "video-embed",
+}
+
+# Domains generally headquartered outside the EU/EEA
+_NON_EU_DOMAINS: set[str] = {
+    "google-analytics.com", "googletagmanager.com", "googlesyndication.com",
+    "doubleclick.net", "google.com", "gstatic.com", "googleapis.com",
+    "facebook.net", "facebook.com", "meta.com", "fbcdn.net",
+    "tiktok.com", "twitter.com", "ads-twitter.com", "x.com",
+    "amplitude.com", "mixpanel.com", "segment.io", "segment.com",
+    "heap.io", "heapanalytics.com", "fullstory.com",
+    "hotjar.com", "clarity.ms",
+    "sentry.io", "newrelic.com", "nr-data.net", "datadoghq.com",
+    "hubspot.com", "hs-analytics.net", "hs-scripts.com",
+    "intercom.io", "intercomcdn.com", "drift.com",
+    "stripe.com", "paypal.com",
+    "cloudflare.com", "jsdelivr.net", "unpkg.com",
+    "youtube.com", "youtu.be",
+}
+
+# CMP identifiers (substring in script src or inline code)
+_CMP_MARKERS: dict[str, str] = {
+    "cookiebot": "Cookiebot",
+    "onetrust": "OneTrust",
+    "cookielaw": "OneTrust (CookieLaw)",
+    "usercentrics": "Usercentrics",
+    "didomi": "Didomi",
+    "quantcast": "Quantcast Choice",
+    "trustarccloud": "TrustArc",
+    "consentmanager": "consentmanager.net",
+    "iubenda": "iubenda",
+    "osano": "Osano",
+    "complianz": "Complianz",
+    "borlabs": "Borlabs Cookie",
+    "klaro": "Klaro!",
+    "termly": "Termly",
+    "cookiefirst": "CookieFirst",
+    "cookie-script": "Cookie-Script",
+    "__tcfapi": "IAB TCF API",
+    "CookieConsent": "Generic CookieConsent",
+}
+
+# Fingerprinting API patterns in inline JS
+_FINGERPRINT_PATTERNS: dict[str, str] = {
+    r"\.toDataURL\(": "canvas-fingerprint",
+    r"getContext\s*\(\s*['\"]webgl": "webgl-fingerprint",
+    r"AudioContext|webkitAudioContext": "audio-fingerprint",
+    r"navigator\.plugins": "plugin-enumeration",
+    r"navigator\.languages": "language-enumeration",
+    r"screen\.(?:width|height|colorDepth)": "screen-fingerprint",
+    r"navigator\.hardwareConcurrency": "hardware-fingerprint",
+    r"navigator\.deviceMemory": "device-memory-probe",
+    r"getBattery": "battery-api-probe",
+    r"RTCPeerConnection": "webrtc-leak",
+}
+
+# PII-indicating form field name patterns
+_PII_FIELD_PATTERNS: dict[str, str] = {
+    r"(?:e-?mail|e_mail)": "email",
+    r"(?:first.?name|vorname|fname)": "first-name",
+    r"(?:last.?name|nachname|lname|surname)": "last-name",
+    r"(?:full.?name)": "name",
+    r"(?:phone|tel|mobile|telefon|handy)": "phone",
+    r"(?:address|street|strasse|straße|addr)": "address",
+    r"(?:zip|postal|plz|postleitzahl)": "postal-code",
+    r"(?:city|stadt|ort)": "city",
+    r"(?:country|land)": "country",
+    r"(?:birth|dob|geburts)": "date-of-birth",
+    r"(?:ssn|social.?security|steuer.?id)": "government-id",
+    r"(?:passport|ausweis|reisepass)": "government-id",
+    r"(?:credit.?card|card.?number|karten)": "payment-card",
+    r"(?:iban|bank|konto)": "bank-account",
+    r"(?:password|passwort|passwd|pwd)": "password",
+    r"(?:gender|geschlecht)": "gender",
+    r"(?:company|firma|unternehmen|organisation)": "company",
+}
+
+# Legal / privacy page link patterns
+_LEGAL_LINK_PATTERNS: dict[str, str] = {
+    r"privacy|datenschutz": "privacy-policy",
+    r"impress|impressum": "impressum",
+    r"cookie.?(?:policy|richtlinie|einstellung)": "cookie-policy",
+    r"terms|agb|nutzungsbedingung|geschäftsbedingung": "terms-of-service",
+    r"legal|rechtlich": "legal-notice",
+    r"dsgvo|gdpr|data.?protection": "data-protection-notice",
+    r"opt.?out|widerspruch": "opt-out",
+}
+
+
+# ---------------------------------------------------------------------------
 # Data model
 # ---------------------------------------------------------------------------
+
+@dataclass
+class CookieInfo:
+    name: str
+    domain: str
+    path: str
+    secure: bool
+    httponly: bool
+    samesite: str  # "Strict" | "Lax" | "None" | "unset"
+    expires: str  # ISO timestamp or "session"
+    classification: str  # "first-party" | "third-party"
+
 
 @dataclass
 class FormFingerprint:
@@ -43,40 +219,199 @@ class FormFingerprint:
     input_count: int
     hidden_inputs: list[str] = field(default_factory=list)
     file_inputs: list[str] = field(default_factory=list)
+    pii_fields: dict[str, str] = field(default_factory=dict)
+    has_password_field: bool = False
+    transmits_over_https: bool = True
+
+
+@dataclass
+class ThirdPartyEntry:
+    domain: str
+    category: str
+    is_non_eu: bool
 
 
 @dataclass
 class Footprint:
-    """Deterministic technical footprint extracted from a single URL."""
+    """Deterministic technical + privacy footprint extracted from a single URL."""
 
+    # --- Core ---
     url: str
     base_domain: str
     status_code: int
     title: str
     generator: str
     content_language: str
-    third_party_script_domains: list[str] = field(default_factory=list)
+
+    # --- TLS ---
+    is_https: bool = True
+    tls_version: str = ""
+    certificate_issuer: str = ""
+    certificate_expiry: str = ""
+    has_mixed_content: bool = False
+
+    # --- Third parties (enriched) ---
+    third_parties: list[ThirdPartyEntry] = field(default_factory=list)
+    third_party_iframes: list[dict] = field(default_factory=list)
+    preconnect_hints: list[str] = field(default_factory=list)
+
+    # --- Scripts & inline ---
     inline_api_endpoints: list[str] = field(default_factory=list)
+    total_script_count: int = 0
+    total_inline_script_bytes: int = 0
+
+    # --- Forms ---
     forms: list[FormFingerprint] = field(default_factory=list)
+
+    # --- GDPR / Privacy ---
+    cookies: list[CookieInfo] = field(default_factory=list)
+    consent_mechanisms_detected: list[str] = field(default_factory=list)
+    fingerprinting_signals: list[str] = field(default_factory=list)
+    storage_api_usage: list[str] = field(default_factory=list)
+    tracking_pixels: list[str] = field(default_factory=list)
+    legal_links: dict[str, str] = field(default_factory=dict)
+
+    # --- Metadata ---
     stylesheets: list[str] = field(default_factory=list)
     meta_tags: dict[str, str] = field(default_factory=dict)
     security_headers: dict[str, str] = field(default_factory=dict)
+    missing_security_headers: list[str] = field(default_factory=list)
     structured_data_types: list[str] = field(default_factory=list)
     open_graph: dict[str, str] = field(default_factory=dict)
     canonical_url: str = ""
-    total_script_count: int = 0
-    total_inline_script_bytes: int = 0
 
     def to_dict(self) -> dict:
         return asdict(self)
 
 
 # ---------------------------------------------------------------------------
-# Deterministic extraction
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _classify_third_party(domain: str) -> tuple[str, bool]:
+    domain_lower = domain.lower()
+    category = "unknown"
+    for pattern, cat in _KNOWN_TRACKERS.items():
+        if pattern in domain_lower:
+            category = cat
+            break
+    is_non_eu = any(d in domain_lower for d in _NON_EU_DOMAINS)
+    return category, is_non_eu
+
+
+def _classify_pii_field(field_name: str) -> str | None:
+    name_lower = field_name.lower()
+    for pattern, pii_type in _PII_FIELD_PATTERNS.items():
+        if re.search(pattern, name_lower):
+            return pii_type
+    return None
+
+
+def _detect_cmp(script_sources: list[str], inline_scripts: list[str]) -> list[str]:
+    found: set[str] = set()
+    combined = " ".join(script_sources) + " " + " ".join(inline_scripts)
+    combined_lower = combined.lower()
+    for marker, name in _CMP_MARKERS.items():
+        if marker.lower() in combined_lower:
+            found.add(name)
+    return sorted(found)
+
+
+def _detect_fingerprinting(inline_scripts: list[str]) -> list[str]:
+    found: set[str] = set()
+    combined = " ".join(inline_scripts)
+    for pattern, label in _FINGERPRINT_PATTERNS.items():
+        if re.search(pattern, combined):
+            found.add(label)
+    return sorted(found)
+
+
+def _detect_storage_api(inline_scripts: list[str]) -> list[str]:
+    found: set[str] = set()
+    combined = " ".join(inline_scripts)
+    if re.search(r"localStorage", combined):
+        found.add("localStorage")
+    if re.search(r"sessionStorage", combined):
+        found.add("sessionStorage")
+    if re.search(r"indexedDB|IDBDatabase", combined):
+        found.add("IndexedDB")
+    if re.search(r"caches\.open|CacheStorage", combined):
+        found.add("CacheStorage")
+    return sorted(found)
+
+
+def _find_legal_links(soup: BeautifulSoup) -> dict[str, str]:
+    links: dict[str, str] = {}
+    for a in soup.find_all("a", href=True):
+        text = a.get_text(strip=True).lower()
+        href = a["href"]
+        combined = text + " " + href.lower()
+        for pattern, link_type in _LEGAL_LINK_PATTERNS.items():
+            if re.search(pattern, combined) and link_type not in links:
+                links[link_type] = href
+                break
+    return links
+
+
+def _find_tracking_pixels(soup: BeautifulSoup, base_domain: str) -> list[str]:
+    pixel_domains: set[str] = set()
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        width = img.get("width", "")
+        height = img.get("height", "")
+        is_tiny = (str(width) in ("0", "1") and str(height) in ("0", "1"))
+        style = img.get("style", "").replace(" ", "")
+        is_hidden = "display:none" in style or "visibility:hidden" in style
+        if (is_tiny or is_hidden) and src.startswith("http"):
+            domain = urlparse(src).netloc
+            if domain and domain != base_domain:
+                pixel_domains.add(domain)
+    for ns in soup.find_all("noscript"):
+        for img in ns.find_all("img"):
+            src = img.get("src", "")
+            if src.startswith("http"):
+                domain = urlparse(src).netloc
+                if domain and domain != base_domain:
+                    pixel_domains.add(domain)
+    return sorted(pixel_domains)
+
+
+def _get_tls_info(hostname: str, port: int = 443) -> dict[str, str]:
+    info: dict[str, str] = {}
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((hostname, port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=hostname) as ssock:
+                info["tls_version"] = ssock.version() or ""
+                cert = ssock.getpeercert()
+                if cert:
+                    for rdn in cert.get("issuer", ()):
+                        for attr_type, attr_value in rdn:
+                            if attr_type == "organizationName":
+                                info["certificate_issuer"] = attr_value
+                    not_after = cert.get("notAfter", "")
+                    if not_after:
+                        info["certificate_expiry"] = not_after
+    except Exception:
+        pass
+    return info
+
+
+def _detect_mixed_content(soup: BeautifulSoup) -> bool:
+    for tag in soup.find_all(["script", "link", "img", "iframe", "source", "video", "audio"]):
+        src = tag.get("src") or tag.get("href") or ""
+        if src.startswith("http://"):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main extraction
 # ---------------------------------------------------------------------------
 
 _INTERESTING_META = {"description", "keywords", "author", "robots", "viewport", "theme-color"}
-_SECURITY_HEADERS = {
+
+_SECURITY_HEADERS_ALL = [
     "content-security-policy",
     "strict-transport-security",
     "x-content-type-options",
@@ -84,7 +419,10 @@ _SECURITY_HEADERS = {
     "x-xss-protection",
     "permissions-policy",
     "referrer-policy",
-}
+    "cross-origin-opener-policy",
+    "cross-origin-embedder-policy",
+    "cross-origin-resource-policy",
+]
 
 _API_CALL_RE = re.compile(
     r"""(?:fetch|axios\.(?:get|post|put|delete|patch)|XMLHttpRequest\.open)\(\s*["'](.*?)["']""",
@@ -101,18 +439,25 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
         ),
         "Accept": "text/html,application/xhtml+xml",
-        "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Language": "en-US,en;q=0.9,de;q=0.8",
     }
 
     try:
-        resp = requests.get(url, headers=headers, timeout=timeout, allow_redirects=True)
+        session = requests.Session()
+        resp = session.get(url, headers=headers, timeout=timeout, allow_redirects=True)
         resp.raise_for_status()
     except requests.RequestException as exc:
         return f"HTTP error: {exc}"
 
     soup = BeautifulSoup(resp.text, "html.parser")
-    parsed = urlparse(resp.url)  # use final URL after redirects
+    parsed = urlparse(resp.url)
     base_domain = parsed.netloc
+    is_https = parsed.scheme == "https"
+
+    # --- TLS ---
+    tls_info: dict[str, str] = {}
+    if is_https:
+        tls_info = _get_tls_info(parsed.hostname or base_domain)
 
     # --- Title ---
     title_tag = soup.find("title")
@@ -148,12 +493,12 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
     # --- Scripts ---
     scripts = soup.find_all("script")
     script_sources = [s["src"] for s in scripts if s.get("src")]
-    third_party: set[str] = set()
+    third_party_domains: set[str] = set()
     for src in script_sources:
         if src.startswith("http"):
             domain = urlparse(src).netloc
             if domain and domain != base_domain:
-                third_party.add(domain)
+                third_party_domains.add(domain)
 
     inline_scripts = [s.string for s in scripts if s.string]
     total_inline_bytes = sum(len(s) for s in inline_scripts)
@@ -161,25 +506,72 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
     for text in inline_scripts:
         api_endpoints.update(_API_CALL_RE.findall(text))
 
+    # --- Third parties (enriched) ---
+    third_parties: list[ThirdPartyEntry] = []
+    for domain in sorted(third_party_domains):
+        cat, non_eu = _classify_third_party(domain)
+        third_parties.append(ThirdPartyEntry(domain=domain, category=cat, is_non_eu=non_eu))
+
+    # --- Iframes ---
+    iframes: list[dict] = []
+    for iframe in soup.find_all("iframe"):
+        src = iframe.get("src", "")
+        if src.startswith("http"):
+            domain = urlparse(src).netloc
+            if domain and domain != base_domain:
+                iframes.append({"domain": domain, "src_snippet": src[:200]})
+
+    # --- Preconnect / dns-prefetch ---
+    preconnect: list[str] = []
+    for link in soup.find_all("link", rel=re.compile(r"preconnect|dns-prefetch")):
+        href = link.get("href", "")
+        if href:
+            preconnect.append(href)
+
     # --- Forms ---
     form_fps: list[FormFingerprint] = []
     for form in soup.find_all("form"):
         action_raw = form.get("action", "")
         full_action = urljoin(resp.url, action_raw) if action_raw else resp.url
-        action_domain = urlparse(full_action).netloc
+        action_parsed = urlparse(full_action)
+        action_domain = action_parsed.netloc
+        is_cross_origin = bool(action_domain and action_domain != base_domain)
+        transmits_https = action_parsed.scheme == "https" if action_raw else is_https
+
         inputs = [
-            {"name": inp.get("name"), "type": inp.get("type", "text")}
+            {"name": inp.get("name", ""), "type": inp.get("type", "text")}
             for inp in form.find_all("input")
             if inp.get("name")
         ]
+
+        pii_fields: dict[str, str] = {}
+        has_pw = False
+        for inp in inputs:
+            if inp["type"] == "password":
+                has_pw = True
+            pii_type = _classify_pii_field(inp["name"])
+            if pii_type:
+                pii_fields[inp["name"]] = pii_type
+
+        for tag_name in ("select", "textarea"):
+            for el in form.find_all(tag_name):
+                el_name = el.get("name", "")
+                if el_name:
+                    pii_type = _classify_pii_field(el_name)
+                    if pii_type:
+                        pii_fields[el_name] = pii_type
+
         form_fps.append(
             FormFingerprint(
                 action=action_raw or "(self)",
                 method=form.get("method", "GET").upper(),
-                is_cross_origin=bool(action_domain and action_domain != base_domain),
+                is_cross_origin=is_cross_origin,
                 input_count=len(inputs),
                 hidden_inputs=[i["name"] for i in inputs if i["type"] == "hidden"],
                 file_inputs=[i["name"] for i in inputs if i["type"] == "file"],
+                pii_fields=pii_fields,
+                has_password_field=has_pw,
+                transmits_over_https=transmits_https,
             )
         )
 
@@ -199,10 +591,68 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
             pass
 
     # --- Security headers ---
-    sec_headers: dict[str, str] = {}
-    for h in _SECURITY_HEADERS:
-        if val := resp.headers.get(h):
-            sec_headers[h] = val[:500]
+    sec_present: dict[str, str] = {}
+    sec_missing: list[str] = []
+    for h in _SECURITY_HEADERS_ALL:
+        val = resp.headers.get(h)
+        if val:
+            sec_present[h] = val[:500]
+        else:
+            sec_missing.append(h)
+
+    # --- Cookies ---
+    cookie_infos: list[CookieInfo] = []
+    raw_set_cookies = resp.headers.get("set-cookie", "")
+    for cookie in session.cookies:
+        samesite = "unset"
+        for fragment in raw_set_cookies.split("\n"):
+            if cookie.name in fragment:
+                frag_lower = fragment.lower()
+                if "samesite=strict" in frag_lower:
+                    samesite = "Strict"
+                elif "samesite=lax" in frag_lower:
+                    samesite = "Lax"
+                elif "samesite=none" in frag_lower:
+                    samesite = "None"
+                break
+
+        expires_val = "session"
+        if cookie.expires:
+            try:
+                expires_val = datetime.fromtimestamp(cookie.expires, tz=timezone.utc).isoformat()
+            except (OSError, ValueError):
+                expires_val = str(cookie.expires)
+
+        cookie_domain = cookie.domain or base_domain
+        is_third = not (
+            cookie_domain == base_domain
+            or cookie_domain.lstrip(".") == base_domain
+            or base_domain.endswith(cookie_domain.lstrip("."))
+        )
+
+        cookie_infos.append(
+            CookieInfo(
+                name=cookie.name,
+                domain=cookie_domain,
+                path=cookie.path or "/",
+                secure=bool(cookie.secure),
+                httponly=(
+                    cookie.has_nonstandard_attr("httponly")
+                    or cookie.has_nonstandard_attr("HttpOnly")
+                ),
+                samesite=samesite,
+                expires=expires_val,
+                classification="third-party" if is_third else "first-party",
+            )
+        )
+
+    # --- GDPR-specific detections ---
+    consent_mechanisms = _detect_cmp(script_sources, inline_scripts)
+    fingerprinting = _detect_fingerprinting(inline_scripts)
+    storage_usage = _detect_storage_api(inline_scripts)
+    tracking_pixels = _find_tracking_pixels(soup, base_domain)
+    legal_links = _find_legal_links(soup)
+    mixed_content = _detect_mixed_content(soup)
 
     return Footprint(
         url=resp.url,
@@ -211,17 +661,31 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
         title=title,
         generator=generator,
         content_language=lang,
-        third_party_script_domains=sorted(third_party)[:25],
+        is_https=is_https,
+        tls_version=tls_info.get("tls_version", ""),
+        certificate_issuer=tls_info.get("certificate_issuer", ""),
+        certificate_expiry=tls_info.get("certificate_expiry", ""),
+        has_mixed_content=mixed_content,
+        third_parties=third_parties,
+        third_party_iframes=iframes[:20],
+        preconnect_hints=preconnect[:15],
         inline_api_endpoints=sorted(api_endpoints)[:15],
+        total_script_count=len(scripts),
+        total_inline_script_bytes=total_inline_bytes,
         forms=form_fps,
+        cookies=cookie_infos,
+        consent_mechanisms_detected=consent_mechanisms,
+        fingerprinting_signals=fingerprinting,
+        storage_api_usage=storage_usage,
+        tracking_pixels=tracking_pixels,
+        legal_links=legal_links,
         stylesheets=stylesheets[:15],
         meta_tags=meta_tags,
-        security_headers=sec_headers,
+        security_headers=sec_present,
+        missing_security_headers=sec_missing,
         structured_data_types=sd_types,
         open_graph=og,
         canonical_url=canonical,
-        total_script_count=len(scripts),
-        total_inline_script_bytes=total_inline_bytes,
     )
 
 
@@ -230,38 +694,101 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
 # ---------------------------------------------------------------------------
 
 _SYSTEM_PROMPT = textwrap.dedent("""\
-    You are a Principal Security & Software Architect performing a technical
-    review of a web page based on its deterministic footprint.
+    You are a Principal Security Architect **and** GDPR / ePrivacy compliance
+    auditor performing a combined technical + regulatory review of a web page,
+    based exclusively on its deterministic footprint.
 
     <rules>
-    - Base every claim on evidence present in the footprint JSON.
-    - Where you infer, mark it explicitly as inference.
+    - Base every claim on evidence in the footprint JSON.
+    - Where you infer, mark it explicitly: *(inference)*.
     - Use concise, professional language.  No filler.
-    - Structure your response with the exact Markdown headings listed below.
+    - For GDPR, reference the relevant Articles (e.g., Art. 6, Art. 44, Art. 13).
+    - For ePrivacy, reference the Directive 2002/58/EC and its national
+      implementations where relevant (e.g. German TTDSG § 25).
+    - When rating severity, use: 🔴 Critical | 🟠 High | 🟡 Medium | 🟢 Low.
+    - Structure your response with the EXACT Markdown headings below.
     </rules>
 
     <output_format>
-    ## Tech Stack
+    ## 1. Tech Stack
     Identify frontend framework(s), CSS framework(s), CMS / generator, and any
     bundler or build-tool fingerprints visible in script paths or filenames.
 
-    ## Data Flow & Third-Party Consumers
-    Classify each third-party domain: ad network, analytics, tag manager, CDN,
-    font provider, social widget, or other.  Highlight anything unusual.
+    ## 2. Data Flow & Third-Party Consumers
+    Classify each third-party domain from the footprint: ad network, analytics,
+    session recording, tag manager, CDN, font provider, payment, social widget,
+    consent management, or other.  Highlight anything unusual or unclassified.
 
-    ## Security & Privacy Assessment
-    - Evaluate present/missing security headers against OWASP best practices.
-    - Flag cross-origin form submissions, excessive hidden inputs, file-upload
-      endpoints, and suspicious inline API calls.
-    - Rate overall security posture: Strong / Adequate / Weak / Critical.
+    ## 3. GDPR Compliance Assessment
 
-    ## SDLC & Infrastructure Inference
-    Based on the above evidence, infer the likely deployment model (static host,
-    PaaS, containerised, traditional server), CI/CD indicators, and backend
-    language/framework hints.
+    ### 3.1 Lawful Basis & Consent
+    - Is a Consent Management Platform (CMP) detected?  If not, flag as 🔴.
+    - Are tracking scripts / cookies loaded BEFORE consent can be given?
+      (Check if analytics / ad scripts appear without a detected CMP — this
+      implies pre-consent loading.)
+    - Evaluate cookie attributes: are `Secure`, `HttpOnly`, `SameSite` set
+      properly?  Flag session cookies without `Secure`/`HttpOnly` as 🟠.
 
-    ## Key Recommendations
-    Actionable, prioritised list (max 5 items).
+    ### 3.2 Data Minimisation & Purpose Limitation (Art. 5)
+    - Are forms collecting PII?  Is the collection proportionate to the
+      apparent purpose of the page?
+    - Flag excessive PII collection (e.g. date-of-birth or government ID
+      on a newsletter form) as 🔴.
+    - Are there hidden form fields that may indicate covert data collection?
+
+    ### 3.3 International Data Transfers (Art. 44–49)
+    - List all third-party domains flagged as non-EU.
+    - For each, note the transfer mechanism likely required (SCCs, adequacy
+      decision, etc.) and the risk level.
+    - Flag heavy reliance on US-based trackers without a detected CMP as 🔴.
+
+    ### 3.4 Transparency & Data Subject Rights (Art. 13–14)
+    - Is a Privacy Policy link present?
+    - Is an Impressum / legal notice present?  (Mandatory for German sites
+      under TMG § 5 / DDG § 5.)
+    - Is a Cookie Policy present?
+    - Flag any missing required legal page as 🟠 or 🔴 depending on severity.
+
+    ### 3.5 Browser Fingerprinting & Tracking (ePrivacy / TTDSG)
+    - List any fingerprinting APIs detected.
+    - Evaluate localStorage / sessionStorage usage — is it likely functional
+      or tracking?  (Functional storage doesn't require consent; tracking
+      does under TTDSG § 25.)
+    - Flag tracking pixels found and their likely purpose.
+
+    ## 4. Security Assessment
+
+    ### 4.1 Transport Security
+    - HTTPS status, TLS version, certificate validity.
+    - Mixed-content issues.
+    - HSTS presence and configuration.
+
+    ### 4.2 Security Headers Audit
+    For each header in the OWASP recommended set, state present ✅ or
+    missing ❌, and note misconfigurations.  Highlight the most impactful
+    gaps.
+
+    ### 4.3 Application Security Signals
+    - Cross-origin form submissions (CSRF risk).
+    - Password fields over non-HTTPS (credential exposure).
+    - File upload endpoints (unrestricted upload risk).
+    - Inline API endpoints found — are any sensitive or internal?
+    - CSP analysis: does it block inline scripts?  Is it report-only?
+
+    ### 4.4 Overall Security Posture
+    Rate: 🔴 Critical | 🟠 Weak | 🟡 Adequate | 🟢 Strong.
+    One-paragraph justification.
+
+    ## 5. Risk Summary Table
+    Produce a Markdown table with columns:
+    | # | Finding | Category | Severity | Regulation | Recommendation |
+
+    Include ALL findings from sections 3 and 4, sorted by severity
+    (🔴 first).  Max 15 rows.
+
+    ## 6. Key Recommendations
+    Top 5 actionable, prioritised recommendations addressing the most
+    severe risks first.
     </output_format>
 """)
 
@@ -270,7 +797,9 @@ def analyze_with_llm(footprint: Footprint, model: str) -> str:
     """Send the footprint to the configured LLM and return the analysis."""
 
     user_msg = (
-        "Analyze the following deterministic footprint extracted from a live web page.\n\n"
+        "Analyze the following deterministic footprint extracted from a live "
+        "web page.  Perform both a security review and a GDPR / ePrivacy "
+        "compliance audit.\n\n"
         "<footprint>\n"
         f"{json.dumps(footprint.to_dict(), indent=2)}\n"
         "</footprint>"
@@ -294,55 +823,130 @@ def analyze_with_llm(footprint: Footprint, model: str) -> str:
 # Markdown export
 # ---------------------------------------------------------------------------
 
+def _build_gdpr_summary_block(fp: Footprint) -> str:
+    """Build a quick-glance GDPR / security summary for the report header."""
+    lines: list[str] = []
+
+    if fp.consent_mechanisms_detected:
+        lines.append(f"✅ CMP detected: {', '.join(fp.consent_mechanisms_detected)}")
+    else:
+        lines.append("❌ **No Consent Management Platform detected**")
+
+    for required, label in [
+        ("privacy-policy", "Privacy Policy"),
+        ("impressum", "Impressum"),
+        ("cookie-policy", "Cookie Policy"),
+    ]:
+        if required in fp.legal_links:
+            lines.append(f"✅ {label} link found")
+        else:
+            lines.append(f"❌ **{label} link not found**")
+
+    non_eu = [tp for tp in fp.third_parties if tp.is_non_eu]
+    if non_eu:
+        lines.append(f"⚠️  {len(non_eu)} third-party domain(s) flagged as non-EU")
+    else:
+        lines.append("✅ No non-EU third-party script domains detected")
+
+    insecure_cookies = [c for c in fp.cookies if not c.secure]
+    if insecure_cookies:
+        lines.append(f"⚠️  {len(insecure_cookies)} cookie(s) without `Secure` flag")
+    tp_cookies = [c for c in fp.cookies if c.classification == "third-party"]
+    if tp_cookies:
+        lines.append(f"⚠️  {len(tp_cookies)} third-party cookie(s)")
+
+    if fp.fingerprinting_signals:
+        lines.append(f"⚠️  Fingerprinting signals: {', '.join(fp.fingerprinting_signals)}")
+
+    if fp.tracking_pixels:
+        lines.append(f"⚠️  Tracking pixels from: {', '.join(fp.tracking_pixels[:5])}")
+
+    if not fp.is_https:
+        lines.append("❌ **Site is not served over HTTPS**")
+    elif fp.has_mixed_content:
+        lines.append("⚠️  Mixed content detected (HTTP resources on HTTPS page)")
+
+    critical_missing = [
+        h for h in fp.missing_security_headers
+        if h in ("content-security-policy", "strict-transport-security", "x-content-type-options")
+    ]
+    if critical_missing:
+        lines.append(f"⚠️  Missing critical security headers: {', '.join(critical_missing)}")
+
+    pii_forms = [f for f in fp.forms if f.pii_fields]
+    if pii_forms:
+        all_pii = set()
+        for f in pii_forms:
+            all_pii.update(f.pii_fields.values())
+        lines.append(f"⚠️  {len(pii_forms)} form(s) collecting PII: {', '.join(sorted(all_pii))}")
+
+    return "\n".join(f"- {l}" for l in lines)
+
+
 def build_markdown(footprint: Footprint, analysis: str, model: str) -> str:
     """Render the full report as a Markdown string."""
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     fp_json = json.dumps(footprint.to_dict(), indent=2)
+    summary_block = _build_gdpr_summary_block(footprint)
 
-    # Build a quick stats line
-    stats_parts = [
+    tracker_count = sum(
+        1 for tp in footprint.third_parties
+        if tp.category not in ("cdn", "font-provider", "unknown")
+    )
+    non_eu_count = sum(1 for tp in footprint.third_parties if tp.is_non_eu)
+    pii_form_count = sum(1 for f in footprint.forms if f.pii_fields)
+
+    stats = " | ".join([
         f"**Domain:** `{footprint.base_domain}`",
         f"**HTTP {footprint.status_code}**",
-        f"**Scripts:** {footprint.total_script_count} ({footprint.total_inline_script_bytes:,} bytes inline)",
-        f"**Third-party domains:** {len(footprint.third_party_script_domains)}",
-        f"**Forms:** {len(footprint.forms)}",
-    ]
-    if footprint.generator != "Unknown":
-        stats_parts.append(f"**Generator:** {footprint.generator}")
+        f"**HTTPS:** {'✅' if footprint.is_https else '❌'}",
+        f"**Scripts:** {footprint.total_script_count}",
+        f"**3rd parties:** {len(footprint.third_parties)} ({tracker_count} trackers, {non_eu_count} non-EU)",
+        f"**Cookies:** {len(footprint.cookies)}",
+        f"**PII forms:** {pii_form_count}",
+    ])
 
     md = textwrap.dedent(f"""\
-# URLLM Report
+        # URLLM — GDPR & Security Audit Report
 
-**URL:** {footprint.url}
-**Analyzed:** {ts} — **Model:** `{model}`
+        > **URL:** {footprint.url}
+        > **Analyzed:** {ts} — **Model:** `{model}`
 
----
+        ---
 
-## Quick Stats
+        ## Quick Stats
 
-{" | ".join(stats_parts)}
+        {stats}
 
----
+        ---
 
-## Deterministic Footprint
+        ## Compliance Quick-Glance
 
-<details>
-<summary>Click to expand raw JSON</summary>
+        {summary_block}
 
-```json
-{fp_json}
-```
+        ---
 
-</details>
+        ## Deterministic Footprint
 
----
+        <details>
+        <summary>Click to expand raw JSON ({len(fp_json):,} chars)</summary>
 
-{analysis}
+        ```json
+        {fp_json}
+        ```
 
----
+        </details>
 
-*Generated by [URLLM](https://github.com/yourname/urllm) v0.2.0*""")
+        ---
+
+        {analysis}
+
+        ---
+
+        *Generated by [URLLM](https://github.com/yourname/urllm) v0.3.0 — \
+This report is automated and does not constitute legal advice.*
+    """)
     return md
 
 
@@ -360,7 +964,7 @@ console = Console()
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         prog="urllm",
-        description="Analyze a URL's technical footprint with GenAI reasoning.",
+        description="Analyze a URL's technical footprint for GDPR & security risks with GenAI.",
     )
     parser.add_argument("url", help="Target URL to analyze")
     parser.add_argument(
@@ -388,7 +992,11 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     # --- Step 1: Deterministic extraction ---
-    console.print(Panel(f"[bold]URLLM[/bold]  Analyzing [cyan]{args.url}[/cyan]"))
+    console.print(Panel(
+        f"[bold]URLLM v0.3.0[/bold]  GDPR & Security Audit\n"
+        f"Target: [cyan]{args.url}[/cyan]",
+        border_style="blue",
+    ))
 
     result = fetch_and_parse(args.url, timeout=args.timeout)
 
@@ -402,14 +1010,18 @@ def main(argv: list[str] | None = None) -> None:
         console.print(Syntax(json.dumps(footprint.to_dict(), indent=2), "json"))
         sys.exit(0)
 
-    # Show extracted data
+    # Quick compliance glance
+    console.print("\n[bold]Compliance Quick-Glance[/bold]")
+    console.print(_build_gdpr_summary_block(footprint))
+
+    # Full footprint
     console.print("\n[bold]Deterministic Footprint[/bold]")
     console.print(Syntax(json.dumps(footprint.to_dict(), indent=2), "json", theme="monokai"))
 
     # --- Step 2: LLM analysis ---
-    console.print(f"\n[dim]Querying [bold]{args.model}[/bold] …[/dim]\n")
+    console.print(f"\n[dim]Querying [bold]{args.model}[/bold] for GDPR & security analysis …[/dim]\n")
     analysis = analyze_with_llm(footprint, model=args.model)
-    console.print(Panel(analysis, title="Architecture Analysis", border_style="green"))
+    console.print(Panel(analysis, title="GDPR & Security Analysis", border_style="green"))
 
     # --- Step 3: Optional Markdown export ---
     if args.output:

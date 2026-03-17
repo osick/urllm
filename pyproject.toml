@@ -1,7 +1,7 @@
 [project]
 name = "urllm"
-version = "0.2.0"
-description = "URL technical footprint analyzer with GenAI architectural reasoning"
+version = "0.3.0"
+description = "URL technical footprint analyzer with GDPR & security-focused GenAI reasoning"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
