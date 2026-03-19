@@ -5,23 +5,24 @@
 URLLM deterministically extracts a web page's full technical and privacy fingerprint — scripts, cookies, CSP, third-party domains, PII forms, fingerprinting signals, tracking pixels, security headers — then hands the structured data to an LLM for a rigorous compliance and security review. No guessing. No raw HTML dumped into a prompt.
 
 ```
-$ urllm https://bahn.de --deep-dive -o report.md --save-sources ./sources/
+$ urllm https://example-shop.com --deep-dive -o report.md --save-sources ./sources/
 ```
 ```
 ╭──────────────────────────────────────────────╮
 │ URLLM v0.3.0  GDPR & Security Audit          │
-│ Target: https://www.bahn.de                  │
+│ Target: https://example-shop.com             │
 ╰──────────────────────────────────────────────╯
 
 Compliance Quick-Glance
 - ❌ No Consent Management Platform detected
 - ✅ Privacy Policy link found
-- ⚠️  1 cookie(s) without Secure flag
-- ⚠️  Tracking pixels from: assets.static-bahn.de
+- ⚠️  3 cookie(s) without Secure flag
+- ⚠️  Tracking pixels from: pixel.tracker.example
+- ⚠️  2 third-party domain(s) flagged as non-EU
 
-  Page HTML:      sources/www.bahn.de_page.html
-  HTTP Headers:   sources/www.bahn.de_headers.json   ← full untruncated CSP here
-  Footprint JSON: sources/www.bahn.de_footprint.json
+  Page HTML:      sources/example-shop.com_page.html
+  HTTP Headers:   sources/example-shop.com_headers.json   ← full untruncated CSP here
+  Footprint JSON: sources/example-shop.com_footprint.json
 
 Querying gemini/gemini-2.5-flash …
 Running deep-dive evidence review …
@@ -82,14 +83,14 @@ urllm <URL> [OPTIONS]
 
 ```bash
 # Quick audit — console output only
-urllm https://spiegel.de
+urllm https://example.com
 
 # Full report with Claude, deep-dive review, and all sources saved
-urllm https://bahn.de \
+urllm https://example.com \
   -m anthropic/claude-sonnet-4-6 \
-  -o bahn-audit.md \
+  -o audit.md \
   --deep-dive \
-  --save-sources ./bahn-sources/
+  --save-sources ./sources/
 
 # Show exactly where each domain was found (script tag, CSP header, etc.)
 urllm https://example.com -v
