@@ -1,162 +1,219 @@
 # URLLM
 
-**Deterministic URL footprint extraction + GenAI-powered GDPR & security audit.**
+**Point it at any URL. Get a grounded GDPR & security audit in seconds.**
 
-URLLM fetches a web page, extracts a structured technical and privacy fingerprint, and hands the result to an LLM for a combined security review and GDPR/ePrivacy compliance audit — grounding the AI analysis in factual, reproducible data rather than raw HTML.
+URLLM deterministically extracts a web page's full technical and privacy fingerprint — scripts, cookies, CSP, third-party domains, PII forms, fingerprinting signals, tracking pixels, security headers — then hands the structured data to an LLM for a rigorous compliance and security review. No guessing. No raw HTML dumped into a prompt.
 
-## Quick Start
+```
+$ urllm https://bahn.de --deep-dive -o report.md --save-sources ./sources/
+```
+```
+╭──────────────────────────────────────────────╮
+│ URLLM v0.3.0  GDPR & Security Audit          │
+│ Target: https://www.bahn.de                  │
+╰──────────────────────────────────────────────╯
 
-```bash
-# Install uv if you don't have it
-curl -LsSf https://astral.sh/uv/install.sh | sh
+Compliance Quick-Glance
+- ❌ No Consent Management Platform detected
+- ✅ Privacy Policy link found
+- ⚠️  1 cookie(s) without Secure flag
+- ⚠️  Tracking pixels from: assets.static-bahn.de
 
-# Clone and run — uv handles the virtualenv and dependencies automatically
-git clone https://github.com/yourname/urllm.git
-cd urllm
-uv run urllm.py https://example.com
+  Page HTML:      sources/www.bahn.de_page.html
+  HTTP Headers:   sources/www.bahn.de_headers.json   ← full untruncated CSP here
+  Footprint JSON: sources/www.bahn.de_footprint.json
+
+Querying gemini/gemini-2.5-flash …
+Running deep-dive evidence review …
+
+Report saved to report.md
 ```
 
-No `pip install`, no `venv` — `uv run` resolves everything from `pyproject.toml` on the fly.
+---
+
+## Why URLLM?
+
+Most "AI website audits" dump raw HTML into a prompt and hope for the best. URLLM is different:
+
+- **Deterministic first** — extraction is pure Python, reproducible, no hallucinations about what the page contains
+- **LLM second** — the model reasons over structured JSON, not markup soup
+- **Grounded citations** — every finding references an actual footprint field
+- **Anti-hallucination deep-dive** — a second adversarial pass stress-tests the initial findings, separates confirmed facts from inferences, and flags what can't be determined from static analysis
+
+But **is is Not legal advice** — this is a technical assessment aid supported by genAI. Involve qualified legal counsel for compliance decisions.
+
+---
+
+## Install
+
+```bash
+# Run instantly with uv (no pip, no venv)
+uv run urllm.py https://example.com
+
+# Or install as a persistent CLI tool
+uv tool install .
+urllm https://example.com
+```
+
+> **uv** is a fast Python package manager. Install it with:
+> `curl -LsSf https://astral.sh/uv/install.sh | sh`
+
+---
 
 ## Usage
 
 ```
-uv run urllm.py <URL> [OPTIONS]
+urllm <URL> [OPTIONS]
 
-Options:
-  -m, --model MODEL    LiteLLM model string (default: gemini/gemini-2.5-flash)
-  -o, --output FILE    Export full audit report to Markdown
-  --json               Print raw footprint JSON and exit (skip LLM call)
-  --timeout SECONDS    HTTP timeout (default: 15)
+  -m, --model MODEL      LiteLLM model string
+                         (default: $LLM_MODEL or gemini/gemini-2.5-flash)
+  -o, --output FILE      Write full audit report to a Markdown file
+  -v, --verbose          Show where each finding was discovered
+                         (which header, tag, or script it came from)
+  --deep-dive            Run a second adversarial pass on every 🔴/🟠 finding:
+                         evidence-grounded, confidence-rated, concrete fixes
+  --save-sources DIR     Save raw page HTML, full HTTP headers, and footprint
+                         JSON to DIR (created if absent)
+  --json                 Print raw footprint JSON and exit (no LLM call needed)
+  --timeout SECONDS      HTTP timeout (default: 15)
 ```
 
 ### Examples
 
 ```bash
-# Default: Gemini Flash analysis, console output
-uv run urllm.py https://spiegel.de
+# Quick audit — console output only
+urllm https://spiegel.de
 
-# Use Claude, export to Markdown
-uv run urllm.py https://bahn.de -m claude-3-5-sonnet-20241022 -o bahn-audit.md
+# Full report with Claude, deep-dive review, and all sources saved
+urllm https://bahn.de \
+  -m anthropic/claude-sonnet-4-6 \
+  -o bahn-audit.md \
+  --deep-dive \
+  --save-sources ./bahn-sources/
 
-# Use GPT-4o
-uv run urllm.py https://example.com -m gpt-4o
+# Show exactly where each domain was found (script tag, CSP header, etc.)
+urllm https://example.com -v
 
-# Just extract the footprint (no LLM call, no API key needed)
-uv run urllm.py https://example.com --json
+# Footprint only — no LLM, no API key needed
+urllm https://example.com --json
 
-# Pipe JSON footprint into jq for quick filtering
-uv run urllm.py https://example.com --json 2>/dev/null | jq '.third_parties[] | select(.is_non_eu)'
+# Pipe JSON into jq — find all non-EU third parties
+urllm https://example.com --json 2>/dev/null \
+  | jq '.third_parties[] | select(.is_non_eu)'
+
+# Use any LiteLLM-supported model
+urllm https://example.com -m gpt-4o
+urllm https://example.com -m ollama/llama3.2
 ```
 
-### Install as a CLI tool
+---
 
-```bash
-uv tool install .
-urllm https://example.com
-```
+## What gets extracted
 
-## What Gets Extracted
+### Third parties & CSP
 
-### Technical Signals
+URLLM finds third-party domains from **four sources**, each tracked separately:
 
-| Signal | Detail |
-|--------|--------|
-| **Meta & generator** | CMS / framework generator tag, language, title |
-| **Third-party script domains** | Classified: ad network, analytics, session recording, CDN, etc. |
-| **Non-EU flag** | Each third party is flagged if headquartered outside the EU/EEA |
-| **Inline API endpoints** | `fetch()` / `axios` calls found in inline JS |
-| **Stylesheets** | External CSS references |
-| **Structured data** | JSON-LD `@type` values |
-| **Open Graph** | OG meta tags for social/sharing metadata |
-| **Third-party iframes** | Embedded content (YouTube, social widgets, etc.) |
-| **Preconnect hints** | `dns-prefetch` / `preconnect` links revealing hidden connections |
+| Source | Example |
+|---|---|
+| `<script src="...">` | `analytics.google.com` via script-src |
+| `<iframe src="...">` | `www.youtube.com` via iframe embed |
+| `<link rel="preconnect">` | `fonts.googleapis.com` via dns-prefetch |
+| **CSP header** | `www.jsctool.com` via `CSP:script-src` |
 
-### GDPR & Privacy Signals
+The CSP source is the most valuable — it reveals domains that are *allowed to run scripts* even if they're not in the current page load. With `--verbose`, each domain shows its exact source in the report.
 
-| Signal | Detail |
-|--------|--------|
-| **Cookies** | Name, domain, `Secure`, `HttpOnly`, `SameSite`, expiry, first/third-party classification |
-| **Consent Management Platform** | Detects 18+ CMPs: Cookiebot, OneTrust, Usercentrics, Didomi, IAB TCF API, etc. |
-| **Tracking pixels** | 1×1 images and noscript fallback tracking images |
-| **Browser fingerprinting** | Canvas, WebGL, AudioContext, WebRTC, battery API, hardware probes |
-| **Client-side storage** | localStorage, sessionStorage, IndexedDB, CacheStorage usage |
-| **PII collection** | Form fields classified: email, phone, name, address, DOB, government ID, payment card, etc. |
-| **Legal links** | Privacy policy, Impressum, cookie policy, terms, opt-out, DSGVO notice |
+### GDPR & privacy signals
 
-### Security Signals
+| Signal | What's checked |
+|---|---|
+| **Cookies** | `Secure`, `HttpOnly`, `SameSite`, expiry, first/third-party |
+| **Consent platforms** | 18+ CMPs: Cookiebot, OneTrust, Usercentrics, Didomi, IAB TCF, … |
+| **Tracking pixels** | 1×1 images and `<noscript>` fallback beacons |
+| **Fingerprinting** | Canvas, WebGL, AudioContext, WebRTC, battery API, hardware probes |
+| **Client-side storage** | localStorage, sessionStorage, IndexedDB, CacheStorage |
+| **PII in forms** | Email, phone, name, address, DOB, government ID, payment card, … |
+| **Legal links** | Privacy policy, Impressum, cookie policy, terms, opt-out notice |
 
-| Signal | Detail |
-|--------|--------|
-| **TLS** | Version, certificate issuer, certificate expiry |
-| **Mixed content** | HTTP resources loaded on HTTPS pages |
-| **Security headers** | 10 OWASP headers checked: CSP, HSTS, X-Frame-Options, Referrer-Policy, COOP, COEP, CORP, etc. |
-| **Form security** | Cross-origin submissions, password fields, file uploads, HTTPS transmission |
+### Security signals
 
-## LLM Output Structure
+| Signal | What's checked |
+|---|---|
+| **TLS** | Version, certificate issuer, expiry |
+| **Security headers** | 10 OWASP headers: CSP, HSTS, X-Frame-Options, Referrer-Policy, COOP, COEP, CORP, … |
+| **CSP quality** | `unsafe-inline`, `unsafe-eval`, missing nonces — decorative vs. effective CSPs |
+| **Mixed content** | HTTP resources on HTTPS pages |
+| **Form security** | Cross-origin submissions, password fields, file uploads |
 
-The prompt produces a structured audit report with six sections:
+---
 
-1. **Tech Stack** — frameworks, CSS, CMS, bundler fingerprints
-2. **Data Flow & Third-Party Consumers** — classified by role
+## Audit report structure
+
+The LLM produces a structured six-section report:
+
+1. **Tech Stack** — frameworks, CMS, bundler fingerprints from script/CSS paths
+2. **Data Flow & Third-Party Consumers** — every domain classified by role
 3. **GDPR Compliance Assessment**
-   - 3.1 Lawful Basis & Consent (CMP detection, pre-consent loading)
-   - 3.2 Data Minimisation (PII proportionality, hidden fields)
-   - 3.3 International Data Transfers (Art. 44–49, SCCs)
-   - 3.4 Transparency (Privacy Policy, Impressum, Cookie Policy)
-   - 3.5 Fingerprinting & Tracking (ePrivacy / TTDSG § 25)
+   - Lawful basis & consent (CMP, pre-consent loading, cookie attributes)
+   - Data minimisation (PII forms, hidden fields)
+   - International transfers (Art. 44–49, SCCs, adequacy)
+   - Transparency (Privacy Policy, Impressum, Cookie Policy)
+   - Fingerprinting & tracking (ePrivacy / TTDSG § 25)
 4. **Security Assessment**
-   - 4.1 Transport Security (TLS, HSTS, mixed content)
-   - 4.2 Security Headers Audit (per-header ✅/❌)
-   - 4.3 Application Security (CSRF, credential exposure, CSP)
-   - 4.4 Overall Posture Rating
-5. **Risk Summary Table** — all findings ranked by severity (🔴🟠🟡🟢)
+   - Transport security (TLS, HSTS, mixed content)
+   - Security headers per-header ✅/❌
+   - Application security (CSRF, CSP effectiveness, credential exposure)
+   - Overall posture rating 🔴/🟠/🟡/🟢
+5. **Risk Summary Table** — all findings sorted by severity
 6. **Key Recommendations** — top 5, prioritised
 
-## Regulatory Coverage
+### With `--deep-dive`
 
-The analysis references these frameworks where applicable:
+A second adversarial pass re-examines every 🔴 Critical and 🟠 High finding:
+
+| Rating | Meaning | LLM must provide |
+|---|---|---|
+| ✅ Confirmed | Direct footprint field + value | Concrete fix with config/code example |
+| ⚠️ Inferred | Plausible but not proven | What additional evidence would confirm it |
+| ❓ Unverifiable | Can't determine from static HTML | Specific human investigation steps |
+
+Unknown domains like `jsctool.com` are forbidden from speculation — the model must state "requires WHOIS lookup / network traffic analysis" rather than guessing.
+
+---
+
+## Regulatory coverage
 
 | Framework | Scope |
-|-----------|-------|
+|---|---|
 | **GDPR** (EU 2016/679) | Art. 5, 6, 13–14, 44–49 |
 | **ePrivacy Directive** (2002/58/EC) | Cookie consent, tracking |
-| **TTDSG** (Germany) | § 25 — consent for non-essential storage |
+| **TTDSG** (Germany) | § 25 — consent for non-essential device storage |
 | **TMG / DDG** (Germany) | § 5 — Impressum obligation |
+
+---
 
 ## Configuration
 
-Set your API key for the provider you want to use:
-
 ```bash
-export GEMINI_API_KEY="..."       # default provider
-export ANTHROPIC_API_KEY="..."    # for claude-* models
-export OPENAI_API_KEY="..."       # for gpt-* models
+export GEMINI_API_KEY="..."       # default provider (Gemini Flash)
+export ANTHROPIC_API_KEY="..."    # for anthropic/* models
+export OPENAI_API_KEY="..."       # for openai/* models
+
+export LLM_MODEL="anthropic/claude-sonnet-4-6"   # override default model
 ```
 
-Override the default model globally:
+Any provider supported by [LiteLLM](https://docs.litellm.ai/docs/providers) works — including local Ollama models.
 
-```bash
-export LLM_MODEL="claude-3-5-sonnet-20241022"
-```
-
-See [LiteLLM supported providers](https://docs.litellm.ai/docs/providers) for the full list.
-
-## Project Structure
-
-```
-urllm/
-├── pyproject.toml   # uv / PEP 621 project metadata
-├── urllm.py         # single-file application
-└── README.md
-```
+---
 
 ## Limitations
 
-- **Static analysis only**: URLLM fetches the server-rendered HTML. JavaScript-rendered content (SPAs) will only be partially visible. For full SPA analysis, consider pairing with a headless browser.
-- **Cookie detection is server-side**: Cookies set via JavaScript are not captured (the `requests` library doesn't execute JS). The inline-JS analysis detects `document.cookie` patterns but cannot enumerate actual values.
-- **Tracker database is curated, not exhaustive**: The ~80 known domains cover the most common trackers in the EU market. Unknown domains are flagged as `"unknown"` for LLM classification.
-- **Not legal advice**: The generated report is a technical assessment aid. Always involve qualified legal counsel for compliance decisions.
+- **Static analysis only** — server-rendered HTML only. JavaScript-heavy SPAs will be partially visible. Pair with a headless browser for full SPA coverage.
+- **Server-side cookies only** — cookies set via `document.cookie` after page load are not captured.
+- **Curated tracker database** — ~80 known domains covering the most common EU-market trackers. Unknown domains are flagged as `"unknown"` for LLM classification.
+- **Not legal advice** — this is a technical assessment aid. Involve qualified legal counsel for compliance decisions.
+
+---
 
 ## License
 
