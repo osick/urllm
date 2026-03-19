@@ -229,6 +229,7 @@ class ThirdPartyEntry:
     domain: str
     category: str
     is_non_eu: bool
+    source: str = "script-src"  # where this domain was discovered
 
 
 @dataclass
@@ -280,8 +281,15 @@ class Footprint:
     open_graph: dict[str, str] = field(default_factory=dict)
     canonical_url: str = ""
 
+    # raw data — excluded from LLM payload, populated during fetch
+    raw_html: str = field(default="", repr=False, compare=False)
+    raw_headers: dict = field(default_factory=dict, repr=False, compare=False)
+
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        d.pop("raw_html", None)
+        d.pop("raw_headers", None)
+        return d
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +405,29 @@ def _get_tls_info(hostname: str, port: int = 443) -> dict[str, str]:
     return info
 
 
+def _extract_csp_domains(csp_value: str) -> list[tuple[str, str]]:
+    """Parse a CSP header and return (domain, directive) pairs."""
+    results: list[tuple[str, str]] = []
+    for directive_chunk in csp_value.split(";"):
+        parts = directive_chunk.strip().split()
+        if not parts:
+            continue
+        directive_name = parts[0]
+        for token in parts[1:]:
+            if token.startswith(("'", "blob:", "data:", "http:", "https:")) and not token.startswith("http"):
+                continue  # keyword or scheme-only token
+            if token.startswith("http://") or token.startswith("https://"):
+                parsed = urlparse(token)
+                domain = parsed.netloc.lstrip("*.")
+                if domain:
+                    results.append((domain, f"CSP:{directive_name}"))
+            elif "." in token and not token.startswith("'"):
+                domain = token.lstrip("*.")
+                if domain:
+                    results.append((domain, f"CSP:{directive_name}"))
+    return results
+
+
 def _detect_mixed_content(soup: BeautifulSoup) -> bool:
     for tag in soup.find_all(["script", "link", "img", "iframe", "source", "video", "audio"]):
         src = tag.get("src") or tag.get("href") or ""
@@ -510,7 +541,7 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
     third_parties: list[ThirdPartyEntry] = []
     for domain in sorted(third_party_domains):
         cat, non_eu = _classify_third_party(domain)
-        third_parties.append(ThirdPartyEntry(domain=domain, category=cat, is_non_eu=non_eu))
+        third_parties.append(ThirdPartyEntry(domain=domain, category=cat, is_non_eu=non_eu, source="script-src"))
 
     # --- Iframes ---
     iframes: list[dict] = []
@@ -654,6 +685,18 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
     legal_links = _find_legal_links(soup)
     mixed_content = _detect_mixed_content(soup)
 
+    # --- Augment third parties with CSP-sourced domains ---
+    existing_domains = {tp.domain for tp in third_parties}
+    csp_value = sec_present.get("content-security-policy", "")
+    if csp_value:
+        for domain, directive in _extract_csp_domains(csp_value):
+            if domain and domain != base_domain and domain not in existing_domains:
+                cat, non_eu = _classify_third_party(domain)
+                third_parties.append(
+                    ThirdPartyEntry(domain=domain, category=cat, is_non_eu=non_eu, source=directive)
+                )
+                existing_domains.add(domain)
+
     return Footprint(
         url=resp.url,
         base_domain=base_domain,
@@ -686,6 +729,8 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
         structured_data_types=sd_types,
         open_graph=og,
         canonical_url=canonical,
+        raw_html=resp.text,
+        raw_headers=dict(resp.headers),
     )
 
 
@@ -883,7 +928,98 @@ def _build_gdpr_summary_block(fp: Footprint) -> str:
     return "\n".join(f"- {l}" for l in lines)
 
 
-def build_markdown(footprint: Footprint, analysis: str, model: str) -> str:
+def _build_findings_location_block(fp: Footprint) -> str:
+    """Build a Findings Location section listing where each domain/signal was discovered."""
+    lines: list[str] = []
+
+    if fp.third_parties:
+        lines.append("### Third-Party Domains")
+        lines.append("")
+        lines.append("| Domain | Category | Non-EU | Found In |")
+        lines.append("|---|---|---|---|")
+        for tp in sorted(fp.third_parties, key=lambda t: t.source):
+            eu_flag = "⚠️ Yes" if tp.is_non_eu else "No"
+            lines.append(f"| `{tp.domain}` | {tp.category} | {eu_flag} | {tp.source} |")
+        lines.append("")
+
+    if fp.tracking_pixels:
+        lines.append("### Tracking Pixels")
+        lines.append("")
+        lines.append("Found in `<img>` tags (1×1 or hidden) / `<noscript>` blocks:")
+        for domain in fp.tracking_pixels:
+            lines.append(f"- `{domain}`")
+        lines.append("")
+
+    if fp.fingerprinting_signals:
+        lines.append("### Fingerprinting Signals")
+        lines.append("")
+        lines.append("Detected in inline `<script>` content:")
+        for sig in fp.fingerprinting_signals:
+            lines.append(f"- {sig}")
+        lines.append("")
+
+    if fp.cookies:
+        lines.append("### Cookies")
+        lines.append("")
+        lines.append("Source: `Set-Cookie` response header")
+        for c in fp.cookies:
+            lines.append(f"- `{c.name}` (domain: `{c.domain}`, {c.classification})")
+        lines.append("")
+
+    if fp.consent_mechanisms_detected:
+        lines.append("### Consent Mechanisms")
+        lines.append("")
+        lines.append("Detected in script `src` attributes and inline `<script>` content:")
+        for cm in fp.consent_mechanisms_detected:
+            lines.append(f"- {cm}")
+        lines.append("")
+
+    if not lines:
+        return "_No notable findings to locate._"
+
+    return "\n".join(lines)
+
+
+def save_sources(footprint: Footprint, directory: Path) -> dict[str, Path]:
+    """Save all raw sources to *directory* and return a label→Path mapping."""
+    directory.mkdir(parents=True, exist_ok=True)
+    safe_domain = re.sub(r"[^\w.-]", "_", footprint.base_domain)
+    ts_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    prefix = directory / f"{safe_domain}_{ts_str}"
+
+    saved: dict[str, Path] = {}
+
+    # 1. Raw HTML page
+    html_path = Path(f"{prefix}_page.html")
+    html_path.write_text(footprint.raw_html, encoding="utf-8")
+    saved["Page HTML"] = html_path
+
+    # 2. Complete HTTP response headers (untruncated — security_headers in footprint are capped at 500 chars)
+    headers_path = Path(f"{prefix}_headers.json")
+    headers_path.write_text(
+        json.dumps(dict(footprint.raw_headers), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    saved["HTTP Headers"] = headers_path
+
+    # 3. Structured footprint JSON
+    footprint_path = Path(f"{prefix}_footprint.json")
+    footprint_path.write_text(
+        json.dumps(footprint.to_dict(), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    saved["Footprint JSON"] = footprint_path
+
+    return saved
+
+
+def build_markdown(
+    footprint: Footprint,
+    analysis: str,
+    model: str,
+    verbose: bool = False,
+    source_paths: dict[str, Path] | None = None,
+) -> str:
     """Render the full report as a Markdown string."""
 
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -907,46 +1043,62 @@ def build_markdown(footprint: Footprint, analysis: str, model: str) -> str:
         f"**PII forms:** {pii_form_count}",
     ])
 
-    md = textwrap.dedent(f"""\
-        # URLLM — GDPR & Security Audit Report
+    verbose_section = ""
+    if verbose:
+        location_block = _build_findings_location_block(footprint)
+        verbose_section = f"\n## Findings Location\n\n{location_block}\n---\n\n"
 
-        > **URL:** {footprint.url}
-        > **Analyzed:** {ts} — **Model:** `{model}`
+    sources_section = ""
+    if source_paths:
+        src_lines = ["## Sources\n", "\nRaw data saved to disk:\n", "\n"]
+        for label, path in source_paths.items():
+            src_lines.append(f"- **{label}:** [{path.name}]({path.resolve()})\n")
+        src_lines.append("\n> **Note:** HTTP Headers file contains the complete, untruncated CSP and all other response headers.\n")
+        src_lines.append("\n---\n\n")
+        sources_section = "".join(src_lines)
 
-        ---
-
-        ## Quick Stats
-
-        {stats}
-
-        ---
-
-        ## Compliance Quick-Glance
-
-        {summary_block}
-
-        ---
-
-        ## Deterministic Footprint
-
-        <details>
-        <summary>Click to expand raw JSON ({len(fp_json):,} chars)</summary>
-
-        ```json
-        {fp_json}
-        ```
-
-        </details>
-
-        ---
-
-        {analysis}
-
-        ---
-
-        *Generated by [URLLM](https://github.com/yourname/urllm) v0.3.0 — \
-This report is automated and does not constitute legal advice.*
-    """)
+    md = (
+        "# URLLM — GDPR & Security Audit Report\n"
+        "\n"
+        f"> **URL:** {footprint.url}\n"
+        f"> **Analyzed:** {ts} — **Model:** `{model}`\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Quick Stats\n"
+        "\n"
+        f"{stats}\n"
+        "\n"
+        "---\n"
+        "\n"
+        "## Compliance Quick-Glance\n"
+        "\n"
+        f"{summary_block}\n"
+        "\n"
+        "---\n"
+        "\n"
+        f"{sources_section}"
+        f"{verbose_section}"
+        "## Deterministic Footprint\n"
+        "\n"
+        "<details>\n"
+        f"<summary>Click to expand raw JSON ({len(fp_json):,} chars)</summary>\n"
+        "\n"
+        "```json\n"
+        f"{fp_json}\n"
+        "```\n"
+        "\n"
+        "</details>\n"
+        "\n"
+        "---\n"
+        "\n"
+        f"{analysis}\n"
+        "\n"
+        "---\n"
+        "\n"
+        "*Generated by [URLLM](https://github.com/yourname/urllm) v0.3.0 — "
+        "This report is automated and does not constitute legal advice.*\n"
+    )
     return md
 
 
@@ -989,6 +1141,18 @@ def main(argv: list[str] | None = None) -> None:
         default=15,
         help="HTTP timeout in seconds (default: 15)",
     )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show findings location details (where each domain/signal was discovered)",
+    )
+    parser.add_argument(
+        "--save-sources",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help="Save all raw sources (HTML, HTTP headers, footprint JSON) to DIR (created if absent)",
+    )
     args = parser.parse_args(argv)
 
     # --- Step 1: Deterministic extraction ---
@@ -1006,6 +1170,13 @@ def main(argv: list[str] | None = None) -> None:
 
     footprint = result
 
+    # --- Optional: save all raw sources ---
+    source_paths: dict[str, Path] | None = None
+    if args.save_sources:
+        source_paths = save_sources(footprint, args.save_sources)
+        for label, path in source_paths.items():
+            console.print(f"[dim]  {label}: [bold]{path}[/bold][/dim]")
+
     if args.json:
         console.print(Syntax(json.dumps(footprint.to_dict(), indent=2), "json"))
         sys.exit(0)
@@ -1013,6 +1184,11 @@ def main(argv: list[str] | None = None) -> None:
     # Quick compliance glance
     console.print("\n[bold]Compliance Quick-Glance[/bold]")
     console.print(_build_gdpr_summary_block(footprint))
+
+    # Verbose: findings location
+    if args.verbose:
+        console.print("\n[bold]Findings Location[/bold]")
+        console.print(_build_findings_location_block(footprint))
 
     # Full footprint
     console.print("\n[bold]Deterministic Footprint[/bold]")
@@ -1025,7 +1201,10 @@ def main(argv: list[str] | None = None) -> None:
 
     # --- Step 3: Optional Markdown export ---
     if args.output:
-        md = build_markdown(footprint, analysis, model=args.model)
+        md = build_markdown(
+            footprint, analysis, model=args.model,
+            verbose=args.verbose, source_paths=source_paths,
+        )
         export_markdown(md, args.output)
         console.print(f"\n[green]Report saved to [bold]{args.output}[/bold][/green]")
 
