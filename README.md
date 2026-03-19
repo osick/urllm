@@ -41,7 +41,8 @@ Most "AI website audits" dump raw HTML into a prompt and hope for the best. URLL
 - **Grounded citations** — every finding references an actual footprint field
 - **Anti-hallucination deep-dive** — a second adversarial pass stress-tests the initial findings, separates confirmed facts from inferences, and flags what can't be determined from static analysis
 
-But **is is Not legal advice** — this is a technical assessment aid supported by genAI. Involve qualified legal counsel for compliance decisions.
+# IMPORTANT 
+urllm **MUST NOT be used as legal advice** — This is a automated technical assessment aid supported by genAI. Involve qualified legal counsel for compliance decisions.
 
 ---
 
