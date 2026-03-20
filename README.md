@@ -9,7 +9,7 @@ $ urllm https://example-shop.com --deep-dive -o report.md --save-sources ./sourc
 ```
 ```
 ╭──────────────────────────────────────────────╮
-│ URLLM v0.3.0  GDPR & Security Audit          │
+│ URLLM v0.4.0  GDPR & Security Audit          │
 │ Target: https://example-shop.com             │
 ╰──────────────────────────────────────────────╯
 
