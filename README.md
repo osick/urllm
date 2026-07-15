@@ -1,5 +1,10 @@
 # URLLM
 
+[![CI](https://github.com/osick/urllm/actions/workflows/ci.yml/badge.svg)](https://github.com/osick/urllm/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/urllm)](https://pypi.org/project/urllm/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://github.com/osick/urllm/blob/main/pyproject.toml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 **Point it at any URL. Get a grounded GDPR & security audit in seconds.**
 
 URLLM deterministically extracts a web page's full technical and privacy fingerprint — scripts, cookies, CSP, third-party domains, PII forms, fingerprinting signals, tracking pixels, security headers — then hands the structured data to an LLM for a rigorous compliance and security review. No guessing. No raw HTML dumped into a prompt.
@@ -41,8 +46,8 @@ Most "AI website audits" dump raw HTML into a prompt and hope for the best. URLL
 - **Grounded citations** — every finding references an actual footprint field
 - **Anti-hallucination deep-dive** — a second adversarial pass stress-tests the initial findings, separates confirmed facts from inferences, and flags what can't be determined from static analysis
 
-# IMPORTANT 
-urllm **MUST NOT be used as legal advice** — This is a automated technical assessment aid supported by genAI. Involve qualified legal counsel for compliance decisions.
+> [!CAUTION]
+> **IMPORTANT:** urllm **MUST NOT be used as legal advice** — this is an automated technical assessment aid supported by genAI. Involve qualified legal counsel for compliance decisions.
 
 ---
 
