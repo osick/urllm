@@ -209,7 +209,7 @@ A second adversarial pass re-examines every 🔴 Critical and 🟠 High finding:
 | ⚠️ Inferred | Plausible but not proven | What additional evidence would confirm it |
 | ❓ Unverifiable | Can't determine from static HTML | Specific human investigation steps |
 
-Unknown domains like `jsctool.com` are forbidden from speculation — the model must state "requires WHOIS lookup / network traffic analysis" rather than guessing.
+Unknown domains are forbidden from speculation — the model must state "requires WHOIS lookup / network traffic analysis" rather than guessing.
 
 ---
 
