@@ -9,7 +9,7 @@ $ urllm https://example-shop.com --deep-dive -o report.md --save-sources ./sourc
 ```
 ```
 ╭──────────────────────────────────────────────╮
-│ URLLM v0.4.0  GDPR & Security Audit          │
+│ URLLM v0.5.0  GDPR & Security Audit          │
 │ Target: https://example-shop.com             │
 ╰──────────────────────────────────────────────╯
 
@@ -76,9 +76,31 @@ urllm <URL> [OPTIONS]
                          evidence-grounded, confidence-rated, concrete fixes
   --save-sources DIR     Save raw page HTML, full HTTP headers, and footprint
                          JSON to DIR (created if absent)
-  --json                 Print raw footprint JSON and exit (no LLM call needed)
+  --json                 Print raw footprint JSON to stdout and exit
+                         (no LLM call needed; status output goes to stderr,
+                         so the JSON pipes cleanly into jq & friends)
+  --fail-on SEVERITY     Exit with code 2 if any deterministic finding is at
+                         or above SEVERITY: low | medium | high | critical.
+                         Rule-based, no API key needed — built for CI/CD gates.
   --timeout SECONDS      HTTP timeout (default: 15)
 ```
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | Success (and `--fail-on` threshold not reached, if set) |
+| 1 | Operational error (fetch failed, timeout, DNS, …) |
+| 2 | `--fail-on` threshold reached — at least one finding at or above the given severity |
+
+The `--fail-on` gate uses only **deterministic, rule-based findings** (never LLM output), so it is reproducible and needs no API key:
+
+| Severity | Findings |
+|---|---|
+| critical | No HTTPS; password form submitting over plain HTTP |
+| high | Trackers or tracking pixels without a detected CMP; mixed content; no privacy policy link |
+| medium | Cookies without `Secure`; fingerprinting signals; missing CSP / HSTS / X-Content-Type-Options |
+| low | Forms collecting PII (informational) |
 
 ### Examples
 
@@ -88,7 +110,7 @@ urllm https://example.com
 
 # Full report with Claude, deep-dive review, and all sources saved
 urllm https://example.com \
-  -m anthropic/claude-sonnet-4-6 \
+  -m anthropic/claude-sonnet-5 \
   -o audit.md \
   --deep-dive \
   --save-sources ./sources/
@@ -102,6 +124,9 @@ urllm https://example.com --json
 # Pipe JSON into jq — find all non-EU third parties
 urllm https://example.com --json 2>/dev/null \
   | jq '.third_parties[] | select(.is_non_eu)'
+
+# CI/CD compliance gate — fail the pipeline on any high or critical finding
+urllm https://staging.example.com --json --fail-on high > footprint.json
 
 # Use any LiteLLM-supported model
 urllm https://example.com -m gpt-4o
@@ -201,7 +226,7 @@ export GEMINI_API_KEY="..."       # default provider (Gemini Flash)
 export ANTHROPIC_API_KEY="..."    # for anthropic/* models
 export OPENAI_API_KEY="..."       # for openai/* models
 
-export LLM_MODEL="anthropic/claude-sonnet-4-6"   # override default model
+export LLM_MODEL="anthropic/claude-sonnet-5"   # override default model
 ```
 
 Any provider supported by [LiteLLM](https://docs.litellm.ai/docs/providers) works — including local Ollama models.
@@ -212,8 +237,23 @@ Any provider supported by [LiteLLM](https://docs.litellm.ai/docs/providers) work
 
 - **Static analysis only** — server-rendered HTML only. JavaScript-heavy SPAs will be partially visible. Pair with a headless browser for full SPA coverage.
 - **Server-side cookies only** — cookies set via `document.cookie` after page load are not captured.
-- **Curated tracker database** — ~80 known domains covering the most common EU-market trackers. Unknown domains are flagged as `"unknown"` for LLM classification.
+- **Curated tracker database** — ~70 known domains covering the most common EU-market trackers. Unknown domains are flagged as `"unknown"` for LLM classification.
 - **Not legal advice** — this is a technical assessment aid. Involve qualified legal counsel for compliance decisions.
+
+---
+
+## Development
+
+```bash
+# Run the test suite (no API key or network access needed —
+# tests run against a local HTTP fixture server, LLM calls are stubbed)
+uv run pytest
+
+# With coverage
+uv run pytest --cov=urllm --cov-report=term-missing
+```
+
+Architectural decisions are documented in [`docs/architecture/`](docs/architecture/).
 
 ---
 

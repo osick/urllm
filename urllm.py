@@ -35,7 +35,10 @@ except Exception:
 
 import requests
 from bs4 import BeautifulSoup, Tag
+import litellm
 from litellm import completion
+
+litellm.suppress_debug_info = True  # no "Give Feedback" banner on retried calls
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -177,7 +180,7 @@ _PII_FIELD_PATTERNS: dict[str, str] = {
     r"(?:phone|tel|mobile|telefon|handy)": "phone",
     r"(?:address|street|strasse|straße|addr)": "address",
     r"(?:zip|postal|plz|postleitzahl)": "postal-code",
-    r"(?:city|stadt|ort)": "city",
+    r"(?:city|stadt|\bort\b)": "city",  # \b: "ort" alone, not "passwort"/"standort"
     r"(?:country|land)": "country",
     r"(?:birth|dob|geburts)": "date-of-birth",
     r"(?:ssn|social.?security|steuer.?id)": "government-id",
@@ -639,11 +642,21 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
 
     # --- Cookies ---
     cookie_infos: list[CookieInfo] = []
-    raw_set_cookies = resp.headers.get("set-cookie", "")
+    # One raw Set-Cookie header per cookie (requests merges them with ", " in
+    # resp.headers, which breaks per-cookie attribute parsing).
+    set_cookie_headers: list[str] = []
+    for r in [*resp.history, resp]:
+        try:
+            set_cookie_headers.extend(r.raw.headers.getlist("Set-Cookie"))
+        except AttributeError:
+            merged = r.headers.get("set-cookie", "")
+            if merged:
+                # split only before a `name=` token so Expires dates survive
+                set_cookie_headers.extend(re.split(r",\s(?=[^;,\s]+=)", merged))
     for cookie in session.cookies:
         samesite = "unset"
-        for fragment in raw_set_cookies.split("\n"):
-            if cookie.name in fragment:
+        for fragment in set_cookie_headers:
+            if fragment.strip().lower().startswith(cookie.name.lower() + "="):
                 frag_lower = fragment.lower()
                 if "samesite=strict" in frag_lower:
                     samesite = "Strict"
@@ -660,11 +673,13 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
             except (OSError, ValueError):
                 expires_val = str(cookie.expires)
 
-        cookie_domain = cookie.domain or base_domain
+        # compare on hostname: base_domain may carry a port, cookie domains never do
+        page_host = parsed.hostname or base_domain
+        cookie_domain = cookie.domain or page_host
+        cookie_host = cookie_domain.lstrip(".")
         is_third = not (
-            cookie_domain == base_domain
-            or cookie_domain.lstrip(".") == base_domain
-            or base_domain.endswith(cookie_domain.lstrip("."))
+            cookie_host == page_host
+            or page_host.endswith("." + cookie_host)
         )
 
         cookie_infos.append(
@@ -738,6 +753,69 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
         raw_html=resp.text,
         raw_headers=dict(resp.headers),
     )
+
+
+# ---------------------------------------------------------------------------
+# Deterministic findings (rule-based, no LLM) — used by --fail-on
+# ---------------------------------------------------------------------------
+
+_SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2, "critical": 3}
+
+# categories that are legitimate infrastructure, not tracking
+_NON_TRACKING_CATEGORIES = {
+    "cdn", "font-provider", "unknown", "captcha", "consent-management", "payment",
+}
+
+
+def deterministic_findings(fp: Footprint) -> list[tuple[str, str]]:
+    """Derive rule-based (severity, message) findings purely from the footprint."""
+    findings: list[tuple[str, str]] = []
+
+    if not fp.is_https:
+        findings.append(("critical", "Site is not served over HTTPS"))
+    for f in fp.forms:
+        if f.has_password_field and not f.transmits_over_https:
+            findings.append(
+                ("critical", f"Password form submits over unencrypted HTTP (action: {f.action})")
+            )
+
+    trackers = [tp for tp in fp.third_parties if tp.category not in _NON_TRACKING_CATEGORIES]
+    if trackers and not fp.consent_mechanisms_detected:
+        findings.append(
+            ("high", f"{len(trackers)} tracking third part(ies) loaded without a detected CMP")
+        )
+    if fp.tracking_pixels and not fp.consent_mechanisms_detected:
+        findings.append(
+            ("high", f"Tracking pixel(s) without a detected CMP: {', '.join(fp.tracking_pixels[:5])}")
+        )
+    if fp.is_https and fp.has_mixed_content:
+        findings.append(("high", "Mixed content: HTTP resources loaded on an HTTPS page"))
+    if "privacy-policy" not in fp.legal_links:
+        findings.append(("high", "No privacy policy link found (GDPR Art. 13 transparency)"))
+
+    insecure_cookies = [c.name for c in fp.cookies if not c.secure]
+    if insecure_cookies:
+        findings.append(("medium", f"Cookie(s) without Secure flag: {', '.join(insecure_cookies)}"))
+    if fp.fingerprinting_signals:
+        findings.append(("medium", f"Fingerprinting signals: {', '.join(fp.fingerprinting_signals)}"))
+    critical_missing = [
+        h for h in fp.missing_security_headers
+        if h in ("content-security-policy", "strict-transport-security", "x-content-type-options")
+    ]
+    if critical_missing:
+        findings.append(("medium", f"Missing critical security headers: {', '.join(critical_missing)}"))
+
+    pii_form_count = sum(1 for f in fp.forms if f.pii_fields)
+    if pii_form_count:
+        findings.append(("low", f"{pii_form_count} form(s) collecting PII"))
+
+    return findings
+
+
+def findings_reach(findings: list[tuple[str, str]], threshold: str) -> list[tuple[str, str]]:
+    """Return the findings whose severity is at or above *threshold*."""
+    min_rank = _SEVERITY_RANK[threshold]
+    return [f for f in findings if _SEVERITY_RANK[f[0]] >= min_rank]
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +922,21 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
 """)
 
 
+def _llm_complete(model: str, messages: list[dict], temperature: float):
+    """Call the LLM, dropping `temperature` for models that reject it.
+
+    Newer models (e.g. Anthropic's Claude Fable 5 / Opus 4.7+) return a 400
+    for any sampling parameter; retry once without it so every LiteLLM
+    provider keeps working.
+    """
+    try:
+        return completion(model=model, messages=messages, temperature=temperature)
+    except Exception as exc:
+        if "temperature" in str(exc).lower():
+            return completion(model=model, messages=messages)
+        raise
+
+
 def analyze_with_llm(footprint: Footprint, model: str) -> str:
     """Send the footprint to the configured LLM and return the analysis."""
 
@@ -857,7 +950,7 @@ def analyze_with_llm(footprint: Footprint, model: str) -> str:
     )
 
     try:
-        resp = completion(
+        resp = _llm_complete(
             model=model,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
@@ -949,7 +1042,7 @@ def deep_dive_analysis(footprint: Footprint, initial_analysis: str, model: str) 
     )
 
     try:
-        resp = completion(
+        resp = _llm_complete(
             model=model,
             messages=[
                 {"role": "system", "content": _DEEP_DIVE_PROMPT},
@@ -1214,7 +1307,7 @@ def build_markdown(
         "> Always verify findings independently and involve qualified legal counsel before making\n"
         "> compliance or regulatory decisions.\n"
         "\n"
-        f"*Generated by [URLLM](https://github.com/yourname/urllm) {__version__}*\n"
+        f"*Generated by [URLLM](https://github.com/osick/urllm) {__version__}*\n"
     )
     return md
 
@@ -1228,6 +1321,7 @@ def export_markdown(md: str, path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 console = Console()
+err_console = Console(stderr=True)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -1280,10 +1374,25 @@ def main(argv: list[str] | None = None) -> None:
             "Costs one extra LLM call."
         ),
     )
+    parser.add_argument(
+        "--fail-on",
+        choices=["low", "medium", "high", "critical"],
+        default=None,
+        metavar="SEVERITY",
+        help=(
+            "Exit with code 2 if any deterministic (non-LLM) finding is at or "
+            "above this severity: low | medium | high | critical. "
+            "Works with --json — no API key needed. Intended as a CI/CD gate."
+        ),
+    )
     args = parser.parse_args(argv)
 
+    # In --json mode stdout carries ONLY the footprint JSON (pipeable to jq);
+    # all status output moves to stderr.
+    status = err_console if args.json else console
+
     # --- Step 1: Deterministic extraction ---
-    console.print(Panel(
+    status.print(Panel(
         f"[bold]URLLM {__version__}[/bold]  GDPR & Security Audit\n"
         f"Target: [cyan]{args.url}[/cyan]",
         border_style="blue",
@@ -1292,7 +1401,7 @@ def main(argv: list[str] | None = None) -> None:
     result = fetch_and_parse(args.url, timeout=args.timeout)
 
     if isinstance(result, str):
-        console.print(f"[red]Error:[/red] {result}")
+        err_console.print(f"[red]Error:[/red] {result}")
         sys.exit(1)
 
     footprint = result
@@ -1302,11 +1411,26 @@ def main(argv: list[str] | None = None) -> None:
     if args.save_sources:
         source_paths = save_sources(footprint, args.save_sources)
         for label, path in source_paths.items():
-            console.print(f"[dim]  {label}: [bold]{path}[/bold][/dim]")
+            status.print(f"[dim]  {label}: [bold]{path}[/bold][/dim]")
+
+    def _exit_with_fail_on() -> None:
+        """Exit 0, or 2 if --fail-on is set and the threshold is reached."""
+        if args.fail_on:
+            gated = findings_reach(deterministic_findings(footprint), args.fail_on)
+            if gated:
+                err_console.print(
+                    f"[red]fail-on={args.fail_on}:[/red] "
+                    f"{len(gated)} finding(s) at or above threshold"
+                )
+                for sev, msg in gated:
+                    err_console.print(f"  [{sev}] {msg}", markup=False)
+                sys.exit(2)
+        sys.exit(0)
 
     if args.json:
-        console.print(Syntax(json.dumps(footprint.to_dict(), indent=2), "json"))
-        sys.exit(0)
+        # plain print, NOT rich: rich wraps long lines and would corrupt the JSON
+        print(json.dumps(footprint.to_dict(), indent=2))
+        _exit_with_fail_on()
 
     # Quick compliance glance
     console.print("\n[bold]Compliance Quick-Glance[/bold]")
@@ -1348,6 +1472,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         export_markdown(md, args.output)
         console.print(f"\n[green]Report saved to [bold]{args.output}[/bold][/green]")
+
+    _exit_with_fail_on()
 
 
 if __name__ == "__main__":
