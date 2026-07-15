@@ -14,7 +14,7 @@ $ urllm https://example-shop.com --deep-dive -o report.md --save-sources ./sourc
 ```
 ```
 ╭──────────────────────────────────────────────╮
-│ URLLM v0.5.0  GDPR & Security Audit          │
+│ URLLM v0.6.0  GDPR & Security Audit          │
 │ Target: https://example-shop.com             │
 ╰──────────────────────────────────────────────╯
 
@@ -102,10 +102,10 @@ The `--fail-on` gate uses only **deterministic, rule-based findings** (never LLM
 
 | Severity | Findings |
 |---|---|
-| critical | No HTTPS; password form submitting over plain HTTP |
-| high | Trackers or tracking pixels without a detected CMP; mixed content; no privacy policy link |
-| medium | Cookies without `Secure`; fingerprinting signals; missing CSP / HSTS / X-Content-Type-Options |
-| low | Forms collecting PII (informational) |
+| critical | No HTTPS; password form over plain HTTP; **exposed secret in page source** (API keys, private keys) |
+| high | Trackers/tracking pixels without a CMP; mixed content; no privacy policy link; **CSP that doesn't restrict scripts** (unsafe-inline/eval/wildcard); **weak TLS version**; **expired certificate** |
+| medium | Cookies without `Secure`; fingerprinting; missing CSP / HSTS / X-Content-Type-Options; **CSP in Report-Only mode**; **missing Subresource Integrity**; **certificate expiring within 30 days**; **short HSTS max-age** |
+| low | Forms collecting PII; **version disclosure** in `Server` / `X-Powered-By`; **no security.txt** (RFC 9116) |
 
 ### Examples
 
@@ -171,9 +171,13 @@ The CSP source is the most valuable — it reveals domains that are *allowed to 
 
 | Signal | What's checked |
 |---|---|
-| **TLS** | Version, certificate issuer, expiry |
-| **Security headers** | 10 OWASP headers: CSP, HSTS, X-Frame-Options, Referrer-Policy, COOP, COEP, CORP, … |
-| **CSP quality** | `unsafe-inline`, `unsafe-eval`, missing nonces — decorative vs. effective CSPs |
+| **TLS** | Version (weak < 1.2), certificate issuer, expiry (expired / expiring soon) |
+| **Security headers** | 10 OWASP headers: CSP, HSTS (+ `max-age` length), X-Frame-Options, Referrer-Policy, COOP, COEP, CORP, … |
+| **CSP quality** | Deterministic parse: `unsafe-inline`, `unsafe-eval`, wildcard sources, missing `object-src` / `base-uri` / `frame-ancestors`, Report-Only mode — decorative vs. effective CSPs |
+| **Exposed secrets** | High-confidence scan of page source: Stripe / AWS / Google / GitHub / Slack / OpenAI keys, PEM private-key blocks (redacted in output) |
+| **Subresource Integrity** | Cross-origin `<script>` / `<link>` loaded without an `integrity` hash (supply-chain risk) |
+| **Version disclosure** | Version strings leaked in `Server` / `X-Powered-By` headers |
+| **security.txt** | RFC 9116 machine-readable security contact policy |
 | **Mixed content** | HTTP resources on HTTPS pages |
 | **Form security** | Cross-origin submissions, password fields, file uploads |
 

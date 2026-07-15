@@ -58,6 +58,22 @@ def test_gdpr_summary_mixed_content_line():
     assert "Mixed content" in urllm._build_gdpr_summary_block(make_fp(has_mixed_content=True))
 
 
+def test_gdpr_summary_flags_exposed_secret():
+    fp = make_fp(exposed_secrets=[{"type": "stripe-secret-key", "redacted": "sk_live_4e…"}])
+    block = urllm._build_gdpr_summary_block(fp)
+    assert "Exposed secret" in block and "stripe-secret-key" in block
+
+
+def test_gdpr_summary_flags_decorative_csp():
+    fp = make_fp(csp_weaknesses=["script-src allows 'unsafe-inline'"])
+    assert "does not effectively restrict scripts" in urllm._build_gdpr_summary_block(fp)
+
+
+def test_gdpr_summary_flags_missing_sri():
+    fp = make_fp(sri_missing=["https://cdn.example.com/a.js"])
+    assert "Subresource Integrity" in urllm._build_gdpr_summary_block(fp)
+
+
 def test_findings_location_block_lists_sources():
     fp = make_fp(
         third_parties=[urllm.ThirdPartyEntry(domain="hotjar.com",

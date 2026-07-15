@@ -23,7 +23,7 @@ import socket
 import sys
 import textwrap
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from importlib.metadata import version as _pkg_version
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
@@ -192,6 +192,19 @@ _PII_FIELD_PATTERNS: dict[str, str] = {
     r"(?:company|firma|unternehmen|organisation)": "company",
 }
 
+# High-confidence secret patterns (deliberately narrow to avoid false positives)
+_SECRET_PATTERNS: dict[str, str] = {
+    "stripe-secret-key": r"sk_live_[0-9a-zA-Z]{16,}",
+    "stripe-restricted-key": r"rk_live_[0-9a-zA-Z]{16,}",
+    "aws-access-key-id": r"AKIA[0-9A-Z]{16}",
+    "google-api-key": r"AIza[0-9A-Za-z\-_]{35}",
+    "github-token": r"gh[pousr]_[0-9A-Za-z]{36,}",
+    "github-fine-grained-pat": r"github_pat_[0-9A-Za-z_]{40,}",
+    "slack-token": r"xox[baprs]-[0-9A-Za-z-]{10,}",
+    "openai-api-key": r"sk-[A-Za-z0-9]{20}T3BlbkFJ[A-Za-z0-9]{20}",
+    "private-key-block": r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP )?PRIVATE KEY-----",
+}
+
 # Legal / privacy page link patterns
 _LEGAL_LINK_PATTERNS: dict[str, str] = {
     r"privacy|datenschutz": "privacy-policy",
@@ -289,6 +302,15 @@ class Footprint:
     structured_data_types: list[str] = field(default_factory=list)
     open_graph: dict[str, str] = field(default_factory=dict)
     canonical_url: str = ""
+
+    # --- Security (deterministic) ---
+    csp_weaknesses: list[str] = field(default_factory=list)
+    csp_report_only: bool = False
+    exposed_secrets: list[dict] = field(default_factory=list)
+    sri_missing: list[str] = field(default_factory=list)
+    server_header: str = ""
+    powered_by: str = ""
+    security_txt_url: str = ""
 
     # raw data — excluded from LLM payload, populated during fetch
     raw_html: str = field(default="", repr=False, compare=False)
@@ -443,6 +465,98 @@ def _detect_mixed_content(soup: BeautifulSoup) -> bool:
         if src.startswith("http://"):
             return True
     return False
+
+
+def analyze_csp(csp_value: str) -> list[str]:
+    """Return a list of weakness labels for a Content-Security-Policy header value.
+
+    Empty/absent CSP returns [] — 'missing CSP' is reported separately, so we
+    only flag weaknesses in a policy that actually exists.
+    """
+    if not csp_value.strip():
+        return []
+
+    directives: dict[str, list[str]] = {}
+    for chunk in csp_value.split(";"):
+        parts = chunk.strip().split()
+        if parts:
+            directives[parts[0].lower()] = [p.lower() for p in parts[1:]]
+
+    weaknesses: list[str] = []
+    script = directives.get("script-src", directives.get("default-src", []))
+    if "'unsafe-inline'" in script:
+        weaknesses.append("script-src allows 'unsafe-inline'")
+    if "'unsafe-eval'" in script:
+        weaknesses.append("script-src allows 'unsafe-eval'")
+    if "*" in script:
+        weaknesses.append("script-src allows wildcard '*'")
+
+    if "object-src" not in directives and "default-src" not in directives:
+        weaknesses.append("no object-src or default-src (plugin content unrestricted)")
+    if "base-uri" not in directives:
+        weaknesses.append("no base-uri (base-tag injection possible)")
+    if "frame-ancestors" not in directives:
+        weaknesses.append("no frame-ancestors (framing/clickjacking not restricted by CSP)")
+    return weaknesses
+
+
+def _detect_exposed_secrets(text: str) -> list[dict]:
+    """Scan *text* for high-confidence secret patterns, returning redacted hits."""
+    found: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for label, pattern in _SECRET_PATTERNS.items():
+        for match in re.findall(pattern, text):
+            key = (label, match)
+            if key in seen:
+                continue
+            seen.add(key)
+            if "PRIVATE KEY" in match:
+                redacted = match  # the header, not the key material
+            elif len(match) > 12:
+                redacted = match[:10] + "…"
+            else:
+                redacted = match
+            found.append({"type": label, "redacted": redacted})
+    return found
+
+
+def _find_missing_sri(soup: BeautifulSoup, base_domain: str) -> list[str]:
+    """Cross-origin <script>/<link rel=stylesheet> without a Subresource Integrity hash."""
+    missing: list[str] = []
+    for tag in soup.find_all("script", src=True):
+        url = tag.get("src", "")
+        if url.startswith("http") and urlparse(url).netloc not in ("", base_domain) and not tag.get("integrity"):
+            missing.append(url[:200])
+    for tag in soup.find_all("link", rel="stylesheet"):
+        url = tag.get("href", "")
+        if url.startswith("http") and urlparse(url).netloc not in ("", base_domain) and not tag.get("integrity"):
+            missing.append(url[:200])
+    return missing
+
+
+def _parse_cert_expiry(expiry: str) -> datetime | None:
+    """Parse an OpenSSL notAfter string (e.g. 'Jun  1 12:00:00 2031 GMT') to a UTC datetime."""
+    if not expiry:
+        return None
+    try:
+        return datetime.fromtimestamp(ssl.cert_time_to_seconds(expiry), tz=timezone.utc)
+    except (ValueError, OSError):
+        return None
+
+
+def _probe_security_txt(session: requests.Session, parsed, *, timeout: int) -> str:
+    """Passively check for an RFC 9116 security.txt; return its URL, or '' if absent."""
+    scheme = parsed.scheme or "https"
+    host = parsed.netloc
+    for path in ("/.well-known/security.txt", "/security.txt"):
+        try:
+            r = session.get(f"{scheme}://{host}{path}", timeout=min(timeout, 5), allow_redirects=True)
+        except requests.RequestException:
+            continue
+        ctype = r.headers.get("content-type", "").lower()
+        if r.status_code == 200 and "text/plain" in ctype and "contact:" in r.text.lower():
+            return r.url
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -718,6 +832,16 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
                 )
                 existing_domains.add(domain)
 
+    # --- Security (deterministic) detections ---
+    csp_ro_value = resp.headers.get("content-security-policy-report-only", "")
+    csp_report_only = bool(csp_ro_value and not csp_value)
+    csp_weaknesses = analyze_csp(csp_value or csp_ro_value)
+    exposed_secrets = _detect_exposed_secrets(resp.text)
+    sri_missing = _find_missing_sri(soup, base_domain)
+    server_header = resp.headers.get("server", "")
+    powered_by = resp.headers.get("x-powered-by", "")
+    security_txt_url = _probe_security_txt(session, parsed, timeout=timeout)
+
     return Footprint(
         url=resp.url,
         base_domain=base_domain,
@@ -750,6 +874,13 @@ def fetch_and_parse(url: str, *, timeout: int = 15) -> Footprint | str:
         structured_data_types=sd_types,
         open_graph=og,
         canonical_url=canonical,
+        csp_weaknesses=csp_weaknesses,
+        csp_report_only=csp_report_only,
+        exposed_secrets=exposed_secrets,
+        sri_missing=sri_missing,
+        server_header=server_header,
+        powered_by=powered_by,
+        security_txt_url=security_txt_url,
         raw_html=resp.text,
         raw_headers=dict(resp.headers),
     )
@@ -767,10 +898,17 @@ _NON_TRACKING_CATEGORIES = {
 }
 
 
-def deterministic_findings(fp: Footprint) -> list[tuple[str, str]]:
-    """Derive rule-based (severity, message) findings purely from the footprint."""
+def deterministic_findings(fp: Footprint, *, now: datetime | None = None) -> list[tuple[str, str]]:
+    """Derive rule-based (severity, message) findings purely from the footprint.
+
+    *now* is used only for TLS-certificate expiry math; it defaults to the
+    current UTC time and is injectable so the checks are deterministically testable.
+    """
+    if now is None:
+        now = datetime.now(timezone.utc)
     findings: list[tuple[str, str]] = []
 
+    # --- Critical ---
     if not fp.is_https:
         findings.append(("critical", "Site is not served over HTTPS"))
     for f in fp.forms:
@@ -778,6 +916,10 @@ def deterministic_findings(fp: Footprint) -> list[tuple[str, str]]:
             findings.append(
                 ("critical", f"Password form submits over unencrypted HTTP (action: {f.action})")
             )
+    for secret in fp.exposed_secrets:
+        findings.append(
+            ("critical", f"Exposed secret in page source: {secret['type']} ({secret['redacted']})")
+        )
 
     trackers = [tp for tp in fp.third_parties if tp.category not in _NON_TRACKING_CATEGORIES]
     if trackers and not fp.consent_mechanisms_detected:
@@ -793,6 +935,34 @@ def deterministic_findings(fp: Footprint) -> list[tuple[str, str]]:
     if "privacy-policy" not in fp.legal_links:
         findings.append(("high", "No privacy policy link found (GDPR Art. 13 transparency)"))
 
+    script_csp_weak = [w for w in fp.csp_weaknesses if w.startswith("script-src")]
+    if script_csp_weak:
+        findings.append(
+            ("high", f"CSP does not effectively restrict scripts: {'; '.join(script_csp_weak)}")
+        )
+    tls_match = re.search(r"TLSv([0-9.]+)", fp.tls_version)
+    if tls_match:
+        try:
+            if float(tls_match.group(1)) < 1.2:
+                findings.append(("high", f"Weak TLS version negotiated: {fp.tls_version}"))
+        except ValueError:
+            pass
+    cert_expiry = _parse_cert_expiry(fp.certificate_expiry)
+    if cert_expiry and cert_expiry < now:
+        findings.append(("high", f"TLS certificate has expired ({fp.certificate_expiry})"))
+
+    # --- Medium ---
+    if fp.csp_report_only:
+        findings.append(("medium", "CSP is deployed in Report-Only mode (not enforced)"))
+    if fp.sri_missing:
+        findings.append(
+            ("medium", f"{len(fp.sri_missing)} cross-origin resource(s) without Subresource Integrity")
+        )
+    if cert_expiry and now <= cert_expiry < now + timedelta(days=30):
+        findings.append(("medium", f"TLS certificate expires within 30 days ({fp.certificate_expiry})"))
+    hsts_match = re.search(r"max-age\s*=\s*(\d+)", fp.security_headers.get("strict-transport-security", ""), re.I)
+    if hsts_match and int(hsts_match.group(1)) < 15552000:  # < 180 days
+        findings.append(("medium", f"HSTS max-age below 6 months ({hsts_match.group(1)}s)"))
     insecure_cookies = [c.name for c in fp.cookies if not c.secure]
     if insecure_cookies:
         findings.append(("medium", f"Cookie(s) without Secure flag: {', '.join(insecure_cookies)}"))
@@ -805,6 +975,12 @@ def deterministic_findings(fp: Footprint) -> list[tuple[str, str]]:
     if critical_missing:
         findings.append(("medium", f"Missing critical security headers: {', '.join(critical_missing)}"))
 
+    # --- Low ---
+    for name, value in (("Server", fp.server_header), ("X-Powered-By", fp.powered_by)):
+        if value and re.search(r"\d+\.\d+", value):
+            findings.append(("low", f"Version disclosure in {name} header: {value}"))
+    if not fp.security_txt_url:
+        findings.append(("low", "No security.txt (RFC 9116) — no machine-readable security contact"))
     pii_form_count = sum(1 for f in fp.forms if f.pii_fields)
     if pii_form_count:
         findings.append(("low", f"{pii_form_count} form(s) collecting PII"))
@@ -902,7 +1078,16 @@ _SYSTEM_PROMPT = textwrap.dedent("""\
     - Password fields over non-HTTPS (credential exposure).
     - File upload endpoints (unrestricted upload risk).
     - Inline API endpoints found — are any sensitive or internal?
-    - CSP analysis: does it block inline scripts?  Is it report-only?
+    - CSP effectiveness: use `csp_weaknesses` and `csp_report_only` — does the
+      policy actually restrict scripts (unsafe-inline/unsafe-eval/wildcard make
+      it decorative), or is it enforced only in Report-Only mode?
+    - **Exposed secrets:** if `exposed_secrets` is non-empty, treat as 🔴
+      Critical — a live credential is in the page source.
+    - Supply chain: cross-origin scripts/styles in `sri_missing` lack
+      Subresource Integrity (tampered-CDN risk).
+    - Version disclosure: `server_header` / `powered_by` revealing versions aid
+      targeted exploitation.
+    - `security_txt_url`: presence of an RFC 9116 security contact policy.
 
     ### 4.4 Overall Security Posture
     Rate: 🔴 Critical | 🟠 Weak | 🟡 Adequate | 🟢 Strong.
@@ -1096,6 +1281,18 @@ def _build_gdpr_summary_block(fp: Footprint) -> str:
 
     if fp.tracking_pixels:
         lines.append(f"⚠️  Tracking pixels from: {', '.join(fp.tracking_pixels[:5])}")
+
+    if fp.exposed_secrets:
+        kinds = ", ".join(sorted({s["type"] for s in fp.exposed_secrets}))
+        lines.append(f"❌ **Exposed secret(s) in page source: {kinds}**")
+
+    if any(w.startswith("script-src") for w in fp.csp_weaknesses):
+        lines.append("⚠️  CSP does not effectively restrict scripts (unsafe-inline/eval/wildcard)")
+    elif fp.csp_report_only:
+        lines.append("⚠️  CSP present but in Report-Only mode (not enforced)")
+
+    if fp.sri_missing:
+        lines.append(f"⚠️  {len(fp.sri_missing)} cross-origin resource(s) without Subresource Integrity")
 
     if not fp.is_https:
         lines.append("❌ **Site is not served over HTTPS**")

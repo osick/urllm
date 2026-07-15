@@ -20,7 +20,9 @@ def http_site():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802 (http.server API)
             body = config["html"].encode("utf-8")
-            self.send_response(config["status"])
+            # send_response_only avoids the default Server/Date headers so tests
+            # can assert on a clean, single Server header from `headers`.
+            self.send_response_only(config["status"])
             self.send_header("Content-Type", "text/html; charset=utf-8")
             for name, value in config["headers"]:
                 self.send_header(name, value)

@@ -17,6 +17,8 @@ def footprint(http_site) -> urllm.Footprint:
     url = http_site(html=FIXTURE_HTML, headers=[
         ("Content-Security-Policy", CSP),
         ("X-Content-Type-Options", "nosniff"),
+        ("Server", "nginx/1.18.0"),
+        ("X-Powered-By", "PHP/7.4.3"),
         ("Set-Cookie", "session_id=abc; Path=/; HttpOnly; SameSite=Lax"),
         ("Set-Cookie", "persistent=1; Path=/; Expires=Wed, 01 Jan 2031 00:00:00 GMT"),
     ])
@@ -109,6 +111,62 @@ def test_structured_data_and_meta(footprint):
 def test_persistent_cookie_expiry_parsed(footprint):
     cookie = next(c for c in footprint.cookies if c.name == "persistent")
     assert cookie.expires.startswith("2031-01-01")
+
+
+def test_version_disclosure_headers_extracted(footprint):
+    assert footprint.server_header == "nginx/1.18.0"
+    assert footprint.powered_by == "PHP/7.4.3"
+
+
+def test_missing_sri_on_cross_origin_scripts(footprint):
+    # the fixture's googletagmanager + cookiebot scripts are cross-origin, no integrity
+    assert any("googletagmanager.com" in u for u in footprint.sri_missing)
+    assert any("cookiebot.com" in u for u in footprint.sri_missing)
+
+
+def test_csp_weaknesses_extracted(footprint):
+    # CSP has no base-uri / frame-ancestors → structural gaps, but scripts are locked down
+    assert footprint.csp_report_only is False
+    assert any("base-uri" in w for w in footprint.csp_weaknesses)
+    assert not any(w.startswith("script-src") for w in footprint.csp_weaknesses)
+
+
+def test_no_security_txt_when_server_returns_html(footprint):
+    # the fixture server answers every path with text/html, so the probe finds no security.txt
+    assert footprint.security_txt_url == ""
+
+
+def test_security_txt_probe_detects_rfc9116_file():
+    """A server serving a real text/plain security.txt at the well-known path is detected."""
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/.well-known/security.txt":
+                body = b"Contact: mailto:security@example.com\nExpires: 2027-01-01T00:00:00z\n"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+            else:
+                body = b"<html><body>home</body></html>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *a):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/"
+        fp = urllm.fetch_and_parse(url)
+        assert not isinstance(fp, str), fp
+        assert fp.security_txt_url.endswith("/.well-known/security.txt")
+    finally:
+        server.shutdown()
 
 
 def test_to_dict_excludes_raw_payloads(footprint):
