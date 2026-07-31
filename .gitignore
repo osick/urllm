@@ -209,3 +209,6 @@ __marimo__/
 # local repo samples directory
 samples/
 .claude/
+
+# urllm scan output artifacts
+footprint.json

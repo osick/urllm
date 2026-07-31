@@ -459,11 +459,27 @@ def _extract_csp_domains(csp_value: str) -> list[tuple[str, str]]:
     return results
 
 
+# <link> rels that actually fetch a subresource (so an http:// href is mixed
+# content). Other rels (alternate, canonical, pingback, dns-prefetch, …) are
+# metadata/navigation and are NOT loaded onto the page.
+_LOADING_LINK_RELS = {
+    "stylesheet", "preload", "prefetch", "modulepreload",
+    "icon", "apple-touch-icon", "mask-icon", "manifest",
+}
+
+
 def _detect_mixed_content(soup: BeautifulSoup) -> bool:
     for tag in soup.find_all(["script", "link", "img", "iframe", "source", "video", "audio"]):
         src = tag.get("src") or tag.get("href") or ""
-        if src.startswith("http://"):
-            return True
+        if not src.startswith("http://"):
+            continue
+        if tag.name == "link":
+            rel = tag.get("rel") or []
+            if isinstance(rel, str):
+                rel = rel.split()
+            if not ({r.lower() for r in rel} & _LOADING_LINK_RELS):
+                continue  # e.g. rel="alternate" RSS link — not a loaded resource
+        return True
     return False
 
 

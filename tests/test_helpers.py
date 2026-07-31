@@ -101,6 +101,28 @@ def test_mixed_content_detection():
     assert not urllm._detect_mixed_content(soup('<script src="https://x.example/a.js"></script>'))
 
 
+def test_mixed_content_stylesheet_link_counts():
+    assert urllm._detect_mixed_content(soup('<link rel="stylesheet" href="http://x.example/a.css">'))
+
+
+def test_mixed_content_ignores_non_loading_link_rels():
+    # RSS alternate, canonical, pingback, dns-prefetch etc. are metadata/navigation,
+    # not loaded subresources — an http:// href there is NOT mixed content.
+    for rel in ("alternate", "canonical", "pingback", "dns-prefetch", "preconnect", "next"):
+        html = f'<link rel="{rel}" href="http://x.example/thing">'
+        assert not urllm._detect_mixed_content(soup(html)), rel
+
+
+def test_mixed_content_rss_alternate_regression():
+    # the exact bild.de shape that produced a false-positive "high" finding
+    html = '<link rel="alternate" type="application/rss+xml" href="http://www.bild.de/rss.html">'
+    assert not urllm._detect_mixed_content(soup(html))
+
+
+def test_mixed_content_preload_link_counts():
+    assert urllm._detect_mixed_content(soup('<link rel="preload" href="http://x.example/f.woff2">'))
+
+
 # --- CSP domain extraction ---
 
 def test_csp_extracts_bare_and_wildcard_domains():

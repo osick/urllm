@@ -14,7 +14,7 @@ $ urllm https://example-shop.com --deep-dive -o report.md --save-sources ./sourc
 ```
 ```
 ╭──────────────────────────────────────────────╮
-│ URLLM v0.6.0  GDPR & Security Audit          │
+│ URLLM v0.6.1  GDPR & Security Audit          │
 │ Target: https://example-shop.com             │
 ╰──────────────────────────────────────────────╯
 
@@ -228,17 +228,71 @@ Unknown domains are forbidden from speculation — the model must state "require
 
 ---
 
-## Configuration
+## LLM setup
 
+URLLM talks to LLMs through [LiteLLM](https://docs.litellm.ai/docs/providers), so **any provider LiteLLM supports works** — you only need to supply two things:
+
+1. **A model string** — pick it with `-m/--model`, or set a default via `LLM_MODEL`. The default is `gemini/gemini-2.5-flash`.
+2. **The matching API key** — as an environment variable named by the provider (`GEMINI_API_KEY`, `ANTHROPIC_API_KEY`, …). Local models (Ollama) need no key.
+
+The model string is always `provider/model-name`. The provider prefix tells LiteLLM which API to call **and** which key to read — get those two aligned and you're done.
+
+> **No key needed for the deterministic path.** `--json` and `--fail-on` run entirely offline (pure-Python extraction, no LLM call), so CI gates work without any API key. A key is only required for the *narrated audit report*.
+
+### Provider examples
+
+**Google Gemini** (default — fast and inexpensive)
 ```bash
-export GEMINI_API_KEY="..."       # default provider (Gemini Flash)
-export ANTHROPIC_API_KEY="..."    # for anthropic/* models
-export OPENAI_API_KEY="..."       # for openai/* models
-
-export LLM_MODEL="anthropic/claude-sonnet-5"   # override default model
+export GEMINI_API_KEY="AIza..."
+urllm https://example.com                              # uses the default gemini/gemini-2.5-flash
+urllm https://example.com -m gemini/gemini-2.5-pro     # deeper reasoning
 ```
 
-Any provider supported by [LiteLLM](https://docs.litellm.ai/docs/providers) works — including local Ollama models.
+**Anthropic Claude**
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+urllm https://example.com -m anthropic/claude-sonnet-5
+urllm https://example.com -m anthropic/claude-opus-5   # highest quality
+```
+
+**OpenAI**
+```bash
+export OPENAI_API_KEY="sk-..."
+urllm https://example.com -m gpt-4o
+urllm https://example.com -m gpt-4o-mini                # cheaper
+```
+
+**Local / self-hosted (Ollama)** — no API key, nothing leaves your machine
+```bash
+ollama pull llama3.2
+urllm https://example.com -m ollama/llama3.2
+# Custom host? point LiteLLM at it:
+export OLLAMA_API_BASE="http://192.168.1.50:11434"
+urllm https://example.com -m ollama/llama3.2
+```
+
+**Azure OpenAI**
+```bash
+export AZURE_API_KEY="..."
+export AZURE_API_BASE="https://your-resource.openai.azure.com"
+export AZURE_API_VERSION="2024-02-15-preview"
+urllm https://example.com -m azure/your-deployment-name
+```
+
+### Set a default model
+
+To avoid passing `-m` every time, export `LLM_MODEL` (an explicit `-m` on the command line still wins):
+
+```bash
+export LLM_MODEL="anthropic/claude-sonnet-5"
+urllm https://example.com          # now uses Claude by default
+```
+
+Put the `export` lines in your `~/.bashrc` / `~/.zshrc` (or a `.env` you source) to make them stick.
+
+> **Compatibility note:** newer models (e.g. Claude Opus 4.7+ / Fable 5) reject sampling parameters. URLLM detects this and automatically retries without `temperature`, so every provider keeps working — you don't need to configure anything.
+
+For the full list of provider prefixes, key names, and model IDs, see the [LiteLLM provider docs](https://docs.litellm.ai/docs/providers).
 
 ---
 
